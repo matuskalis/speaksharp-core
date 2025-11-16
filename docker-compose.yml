@@ -1,0 +1,46 @@
+version: '3.8'
+
+services:
+  db:
+    image: postgres:16-alpine
+    container_name: speaksharp-db
+    environment:
+      POSTGRES_DB: speaksharp_db
+      POSTGRES_USER: speaksharp_user
+      POSTGRES_PASSWORD: speaksharp_pass
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./database/schema.sql:/docker-entrypoint-initdb.d/schema.sql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U speaksharp_user -d speaksharp_db"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  api:
+    build: .
+    container_name: speaksharp-api
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql://speaksharp_user:speaksharp_pass@db:5432/speaksharp_db
+      SPEAKSHARP_ENABLE_LLM: "true"
+      SPEAKSHARP_ENABLE_ASR: "true"
+      SPEAKSHARP_ENABLE_TTS: "true"
+      # Override with actual API key via .env or export
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      SPEAKSHARP_LLM_PROVIDER: ${SPEAKSHARP_LLM_PROVIDER:-openai}
+      SPEAKSHARP_DEBUG: ${SPEAKSHARP_DEBUG:-false}
+    ports:
+      - "8000:8000"
+    volumes:
+      # Mount source code for development (optional - remove in production)
+      - ./app:/app/app
+    restart: unless-stopped
+
+volumes:
+  postgres_data:
