@@ -25,7 +25,7 @@ class VoiceSession:
 
     def __init__(
         self,
-        user_id: UUID,
+        user_level: str = "A1",
         mode: Literal["scenario", "free_chat", "drill", "lesson"] = "free_chat",
         context: Optional[Dict[str, Any]] = None
     ):
@@ -33,11 +33,11 @@ class VoiceSession:
         Initialize voice session.
 
         Args:
-            user_id: User identifier
+            user_level: User's CEFR level (A1-C2)
             mode: Session mode (scenario, free_chat, drill, lesson)
             context: Optional context dict (scenario_id, drill_type, etc.)
         """
-        self.user_id = user_id
+        self.user_level = user_level
         self.mode = mode
         self.context = context or {}
         self.tutor = TutorAgent()
@@ -68,7 +68,9 @@ class VoiceSession:
         if isinstance(audio_input, str):
             asr_result = asr_client.transcribe_file(audio_input)
         elif isinstance(audio_input, bytes):
-            asr_result = asr_client.transcribe_bytes(audio_input)
+            # Extract filename from context if available
+            filename = self.context.get("filename", "audio.webm")
+            asr_result = asr_client.transcribe_bytes(audio_input, filename=filename)
         else:
             raise ValueError(f"Invalid audio_input type: {type(audio_input)}")
 
@@ -77,6 +79,7 @@ class VoiceSession:
         # Step 2: Tutor - process text through tutor agent
         tutor_context = {
             "mode": self.mode,
+            "level": self.user_level,
             **self.context
         }
 

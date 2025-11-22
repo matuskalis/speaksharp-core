@@ -114,11 +114,28 @@ Functions: `get_due_cards()`, `update_card_after_review()`, `create_card_from_er
 
 ## Installation
 
+### Local Development
+
 ```bash
 cd speaksharp-core
+
+# Create virtual environment
 python -m venv venv
 source venv/bin/activate  # On Windows: venv\Scripts\activate
+
+# Install dependencies
 pip install -r requirements.txt
+```
+
+### Docker (Recommended for Production)
+
+```bash
+# Build and run with docker-compose
+docker compose up --build
+
+# Or build Docker image manually
+docker build -t speaksharp-core .
+docker run -p 8000:8000 -e DATABASE_URL="..." speaksharp-core
 ```
 
 ## LLM Configuration (Optional)
@@ -172,44 +189,61 @@ python config.py
 
 The system includes full PostgreSQL/Supabase integration for persistence.
 
-### Database Setup
+### Option 1: Docker Compose (Easiest)
 
-1. **Create a PostgreSQL database** (local or Supabase):
+```bash
+# Database is automatically created and configured
+docker compose up --build
+
+# Schema is applied on first startup via docker-entrypoint-initdb.d
+```
+
+### Option 2: Local PostgreSQL
+
+1. **Install PostgreSQL**:
    ```bash
-   # Local PostgreSQL
-   createdb speaksharp
+   # macOS
+   brew install postgresql@16
+   brew services start postgresql@16
 
-   # OR use Supabase (recommended for production)
-   # Create a new project at https://supabase.com
+   # Ubuntu/Debian
+   sudo apt-get install postgresql-16
+
+   # Or use Docker
+   docker run --name speaksharp-db -e POSTGRES_PASSWORD=speaksharp_pass \
+     -e POSTGRES_USER=speaksharp_user -e POSTGRES_DB=speaksharp_db \
+     -p 5432:5432 -d postgres:16-alpine
    ```
 
-2. **Run the schema**:
+2. **Create database and apply schema**:
    ```bash
-   psql speaksharp < database/schema.sql
+   # Create database
+   createdb speaksharp_db
 
-   # OR for Supabase, run the SQL in the SQL Editor
+   # Apply schema
+   psql speaksharp_db < database/schema.sql
    ```
 
-3. **Set database environment variables**:
+3. **Set environment variables**:
    ```bash
-   # Option 1: Connection string (recommended)
-   export DATABASE_URL="postgresql://user:password@localhost:5432/speaksharp"
+   # Create .env file from example
+   cp .env.example .env
 
-   # OR for Supabase
-   export SUPABASE_DB_URL="postgresql://postgres:[password]@db.[project-ref].supabase.co:5432/postgres"
-
-   # Option 2: Individual components
-   export DB_HOST=localhost
-   export DB_PORT=5432
-   export DB_NAME=speaksharp
-   export DB_USER=postgres
-   export DB_PASSWORD=yourpassword
+   # Edit .env and set DATABASE_URL
+   export DATABASE_URL="postgresql://speaksharp_user:speaksharp_pass@localhost:5432/speaksharp_db"
    ```
 
 4. **Test database connection**:
    ```bash
    python test_db_integration.py
    ```
+
+### Option 3: Supabase (Production)
+
+1. Create a new project at https://supabase.com
+2. Run `database/schema.sql` in the Supabase SQL Editor
+3. Get your connection string from Project Settings → Database
+4. Set `DATABASE_URL` environment variable
 
 ### Database Module Usage
 
@@ -241,24 +275,47 @@ error = db.log_error(
 )
 ```
 
-## API Server
+## Running the Application
 
-The system includes a FastAPI-based REST API for integration with frontends.
-
-### Starting the API Server
+### Option 1: Docker Compose (Recommended)
 
 ```bash
-# Make sure database is configured first
-source venv/bin/activate
-python -m app.api
+# Start both database and API
+docker compose up --build
 
-# OR with uvicorn directly
-uvicorn app.api:app --reload --host 0.0.0.0 --port 8000
+# Run in background
+docker compose up -d
+
+# View logs
+docker compose logs -f api
+
+# Stop services
+docker compose down
 ```
 
 The API will be available at `http://localhost:8000`
 
+### Option 2: Local Development
+
+```bash
+# Make sure database is running and configured
+export DATABASE_URL="postgresql://speaksharp_user:speaksharp_pass@localhost:5432/speaksharp_db"
+
+# Activate virtual environment
+source venv/bin/activate
+
+# Start API server
+python -m app.api
+
+# OR with uvicorn directly (with auto-reload)
+uvicorn app.api:app --reload --host 0.0.0.0 --port 8000
+```
+
+### API Documentation
+
 Interactive API docs: `http://localhost:8000/docs`
+
+Alternative docs: `http://localhost:8000/redoc`
 
 ### API Endpoints
 
@@ -323,7 +380,44 @@ curl -X POST http://localhost:8000/api/tutor/voice \
 
 See full API documentation at `http://localhost:8000/docs` when the server is running.
 
-## Run End-to-End Demo
+## Testing
+
+### Run Pytest Tests
+
+```bash
+# Activate virtual environment
+source venv/bin/activate
+
+# Run all tests
+pytest
+
+# Run with verbose output
+pytest -v
+
+# Run specific test file
+pytest tests/test_api_endpoints.py
+
+# Run specific test class
+pytest tests/test_api_endpoints.py::TestTutorEndpoints
+
+# Run specific test
+pytest tests/test_api_endpoints.py::TestTutorEndpoints::test_tutor_text_basic
+```
+
+### Run Legacy Test Scripts
+
+```bash
+# Database integration tests
+python test_db_integration.py
+
+# LLM integration tests
+python test_llm_modes.py
+
+# Voice pipeline tests
+python test_voice_modes.py
+```
+
+### Run End-to-End Demo
 
 ```bash
 python demo_integration.py
@@ -411,14 +505,75 @@ Tutor responses are strict JSON:
 }
 ```
 
+## Development Tools
+
+### Code Formatting
+
+```bash
+# Format code with black
+black app/ tests/
+
+# Sort imports with isort
+isort app/ tests/
+
+# Check code style with flake8
+flake8 app/ tests/
+
+# Run all formatting tools
+black app/ tests/ && isort app/ tests/ && flake8 app/ tests/
+```
+
+### Environment Variables
+
+All configuration is done via environment variables. See `.env.example` for all available options.
+
+**Required for API:**
+- `DATABASE_URL` - PostgreSQL connection string
+
+**Optional (for real LLM/Voice features):**
+- `OPENAI_API_KEY` - OpenAI API key
+- `ANTHROPIC_API_KEY` - Anthropic API key
+- `SPEAKSHARP_LLM_PROVIDER` - "openai" or "anthropic"
+- `SPEAKSHARP_ENABLE_LLM` - "true" or "false"
+- `SPEAKSHARP_ENABLE_ASR` - "true" or "false"
+- `SPEAKSHARP_ENABLE_TTS` - "true" or "false"
+
+**Development:**
+- `SPEAKSHARP_DEBUG` - Enable debug logging
+- `SPEAKSHARP_LOG_API` - Log API calls
+
+## Docker Commands
+
+```bash
+# Build image
+docker build -t speaksharp-core .
+
+# Run container
+docker run -p 8000:8000 \
+  -e DATABASE_URL="postgresql://..." \
+  -e OPENAI_API_KEY="..." \
+  speaksharp-core
+
+# Docker Compose commands
+docker compose up --build       # Build and start
+docker compose up -d            # Start in background
+docker compose down             # Stop services
+docker compose logs -f api      # Follow API logs
+docker compose exec api bash    # Shell into API container
+docker compose exec db psql -U speaksharp_user -d speaksharp_db  # DB shell
+```
+
 ## Next Steps
 
-- Integrate with real LLM API (OpenAI, Anthropic, etc.)
-- Add ASR for speech input
-- Connect Supabase database
-- Build client UI (web/mobile)
-- Add more scenarios beyond MVP (currently 5/5 for MVP, target 30-50 for V1)
-- Expand lessons beyond A2 level (currently 11 A1-A2 lessons)
-- Implement pronunciation scoring
-- Add analytics and progress tracking
-- Integrate lesson delivery into state machine daily loop
+- ✅ Database layer with PostgreSQL/Supabase
+- ✅ REST API with FastAPI
+- ✅ Docker containerization
+- ✅ Pytest test suite
+- ✅ LLM integration (OpenAI/Anthropic)
+- ✅ Voice pipeline (ASR/TTS)
+- 🔄 Build client UI (web/mobile)
+- 🔄 Add authentication (Supabase Auth)
+- 🔄 Add more scenarios (currently 5, target 30-50)
+- 🔄 Expand lessons beyond A2 (currently 11 A1-A2 lessons)
+- 🔄 Implement pronunciation scoring
+- 🔄 Add analytics and progress tracking

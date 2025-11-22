@@ -40,6 +40,8 @@ class TutorResponse(BaseModel):
     message: str
     errors: List[Error] = []
     micro_task: Optional[str] = None
+    scenario_complete: Optional[bool] = None
+    success_evaluation: Optional[str] = None
 
 
 class ScenarioTemplate(BaseModel):

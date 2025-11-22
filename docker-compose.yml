@@ -35,6 +35,7 @@ services:
       ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
       SPEAKSHARP_LLM_PROVIDER: ${SPEAKSHARP_LLM_PROVIDER:-openai}
       SPEAKSHARP_DEBUG: ${SPEAKSHARP_DEBUG:-false}
+      SPEAKSHARP_LOG_API: ${SPEAKSHARP_LOG_API:-false}
     ports:
       - "8000:8000"
     volumes:

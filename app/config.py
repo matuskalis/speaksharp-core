@@ -8,6 +8,10 @@ import os
 from typing import Optional
 from pathlib import Path
 from pydantic import BaseModel, Field
+from dotenv import load_dotenv
+
+# Load .env file if it exists
+load_dotenv()
 
 
 class LLMConfig(BaseModel):

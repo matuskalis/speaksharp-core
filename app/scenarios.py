@@ -88,6 +88,150 @@ SCENARIO_TEMPLATES: Dict[str, ScenarioTemplate] = {
             "people_met": [],
             "feelings": []
         }
+    ),
+
+    "shopping_clothes": ScenarioTemplate(
+        scenario_id="shopping_clothes",
+        title="Shopping for Clothes",
+        level_min="A2",
+        level_max="B1",
+        situation_description="You are in a clothing store looking for something specific to buy. A sales assistant approaches to help you.",
+        user_goal="Find the right item, ask about sizes/colors/prices, try something on, and make a purchase decision.",
+        task="Look for a specific item, ask the sales assistant for help, inquire about details, try it on, and decide whether to buy it.",
+        success_criteria="Use shopping vocabulary correctly, ask about size/color/price, use comparatives if needed, express preferences, handle the transaction.",
+        difficulty_tags=["transactional", "shopping_vocabulary", "adjectives", "comparatives", "polite_requests"],
+        user_variables={
+            "item_looking_for": "shirt",
+            "preferred_color": "",
+            "size": "",
+            "budget": ""
+        }
+    ),
+
+    "job_interview": ScenarioTemplate(
+        scenario_id="job_interview",
+        title="Job Interview",
+        level_min="B1",
+        level_max="C1",
+        situation_description="You are at a job interview for a position you applied for. The interviewer will ask you about your background, experience, and why you want the job.",
+        user_goal="Present yourself professionally, answer questions about your experience and skills, ask relevant questions about the position.",
+        task="Introduce yourself professionally, describe your experience and qualifications, explain why you're interested in the role, and ask thoughtful questions about the job.",
+        success_criteria="Use professional language, describe past experience using past tenses, express future plans, use formal register, demonstrate confidence and politeness.",
+        difficulty_tags=["professional", "formal_register", "past_experience", "future_plans", "complex_sentences"],
+        user_variables={
+            "job_title": "",
+            "years_experience": 0,
+            "key_skills": [],
+            "career_goals": ""
+        }
+    ),
+
+    "hotel_checkin": ScenarioTemplate(
+        scenario_id="hotel_checkin",
+        title="Hotel Check-in",
+        level_min="A2",
+        level_max="B1",
+        situation_description="You arrive at a hotel where you have a reservation. You need to check in at the front desk.",
+        user_goal="Successfully check in to your hotel room, confirm your reservation details, ask about hotel amenities, and get your room key.",
+        task="Check in using your reservation, confirm dates and room type, ask about breakfast/wifi/facilities, and get directions to your room.",
+        success_criteria="Provide reservation details clearly, ask relevant questions about facilities, use polite language, confirm important information.",
+        difficulty_tags=["transactional", "travel_vocabulary", "polite_requests", "question_formation", "confirmation"],
+        user_variables={
+            "reservation_name": "",
+            "number_nights": 0,
+            "room_type": "",
+            "special_requests": []
+        }
+    ),
+
+    "restaurant_complaint": ScenarioTemplate(
+        scenario_id="restaurant_complaint",
+        title="Handling a Restaurant Problem",
+        level_min="B1",
+        level_max="B2",
+        situation_description="You're at a restaurant and there's a problem with your order - either it's wrong, cold, or not what you expected. You need to politely address this with the waiter.",
+        user_goal="Politely explain the problem, describe what's wrong, and request a solution (replacement, discount, etc.).",
+        task="Get the waiter's attention, explain the issue calmly and politely, describe what's wrong, and negotiate a resolution.",
+        success_criteria="Use polite complaint language ('I'm afraid...', 'There seems to be...'), describe the problem clearly, avoid being rude, negotiate a solution professionally.",
+        difficulty_tags=["transactional", "complaint_language", "polite_disagreement", "problem_solving", "negotiation"],
+        user_variables={
+            "problem_type": "wrong_order",
+            "what_ordered": "",
+            "what_received": "",
+            "preferred_solution": ""
+        }
+    ),
+
+    "bank_inquiry": ScenarioTemplate(
+        scenario_id="bank_inquiry",
+        title="Bank Account Inquiry",
+        level_min="B1",
+        level_max="B2",
+        situation_description="You need to visit your bank to inquire about opening a new account or solving an issue with your current account.",
+        user_goal="Explain your banking need, understand the options/solutions available, ask clarifying questions, and decide on next steps.",
+        task="Speak with a bank representative, explain what you need, ask about fees/requirements/documents, and understand the process.",
+        success_criteria="Use formal banking vocabulary, ask clear questions, understand complex information, take notes on requirements, confirm next steps.",
+        difficulty_tags=["transactional", "formal_register", "financial_vocabulary", "question_formation", "comprehension"],
+        user_variables={
+            "inquiry_type": "new_account",
+            "account_type": "",
+            "concerns": [],
+            "requirements": []
+        }
+    ),
+
+    "making_work_friends": ScenarioTemplate(
+        scenario_id="making_work_friends",
+        title="Making Friends at Work",
+        level_min="A2",
+        level_max="B2",
+        situation_description="It's your first week at a new job. You're in the break room and a friendly coworker starts a conversation with you.",
+        user_goal="Build rapport with your new coworker, share information about yourself, ask about them and the workplace, and establish a friendly connection.",
+        task="Introduce yourself, talk about your role and background, ask about their work, discuss workplace culture, and suggest connecting outside of work.",
+        success_criteria="Use conversational English, ask follow-up questions, find common ground, express interest genuinely, use appropriate level of formality for workplace.",
+        difficulty_tags=["social", "workplace_vocabulary", "small_talk", "question_formation", "rapport_building"],
+        user_variables={
+            "your_role": "",
+            "previous_company": "",
+            "interests": [],
+            "questions_about_company": []
+        }
+    ),
+
+    "apartment_viewing": ScenarioTemplate(
+        scenario_id="apartment_viewing",
+        title="Viewing an Apartment to Rent",
+        level_min="B1",
+        level_max="C1",
+        situation_description="You're viewing an apartment that you might want to rent. The landlord or agent is showing you around and you need to ask important questions.",
+        user_goal="Assess if the apartment meets your needs, ask all necessary questions about rent/utilities/rules, negotiate terms if needed.",
+        task="Tour the apartment, ask about rent, utilities, deposit, lease terms, rules, and neighborhood. Express interest or concerns and discuss next steps.",
+        success_criteria="Ask comprehensive questions about practical matters, use conditional language ('If I were to take it...'), negotiate politely, understand legal/financial terms.",
+        difficulty_tags=["transactional", "housing_vocabulary", "negotiation", "conditionals", "formal_language"],
+        user_variables={
+            "budget": "",
+            "move_in_date": "",
+            "must_haves": [],
+            "concerns": []
+        }
+    ),
+
+    "flight_delay": ScenarioTemplate(
+        scenario_id="flight_delay",
+        title="Dealing with Flight Delay",
+        level_min="B1",
+        level_max="B2",
+        situation_description="Your flight has been delayed and you're at the airline desk trying to understand what's happening and what options you have.",
+        user_goal="Get information about the delay, understand your options (rebooking, compensation, hotel), and make a decision.",
+        task="Explain your situation, ask about the delay reason and duration, inquire about compensation/rebooking/accommodation, and decide on your next steps.",
+        success_criteria="Stay calm and polite despite frustration, ask clear questions about options, understand complex information about policies, make an informed decision.",
+        difficulty_tags=["transactional", "travel_vocabulary", "problem_solving", "formal_complaints", "decision_making"],
+        user_variables={
+            "destination": "",
+            "reason_for_travel": "business",
+            "urgency": "moderate",
+            "connecting_flights": False
+        }
     )
 }
 

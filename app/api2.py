@@ -14,7 +14,7 @@ from typing import Optional, List, Dict, Any
 from datetime import datetime
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, HTTPException, Depends, File, UploadFile, Header, Request
+from fastapi import FastAPI, HTTPException, Depends, File, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
@@ -220,83 +220,6 @@ async def create_user(
         raise HTTPException(status_code=500, detail=f"Failed to create user: {str(e)}")
 
 
-@app.get("/api/users/me", tags=["Users"])
-async def get_current_user(
-    request: Request,
-    db: Database = Depends(get_database),
-):
-    """
-    Get current user's profile from JWT token.
-
-    Requires JWT authentication. User ID is extracted from the token.
-    User profile is auto-created on first request if it doesn't exist.
-
-    Returns:
-        User profile
-    """
-    # Manually extract authorization header from request
-    authorization = request.headers.get("authorization")
-    print(f"DEBUG: get_current_user called with authorization={authorization[:50] if authorization else 'None'}")
-
-    # Verify token and get user ID
-    if not authorization:
-        raise HTTPException(status_code=401, detail="Missing authorization header")
-
-    # Extract token from "Bearer {token}" format
-    parts = authorization.split()
-    if len(parts) != 2 or parts[0].lower() != "bearer":
-        raise HTTPException(status_code=401, detail="Invalid authorization header format")
-
-    token = parts[1]
-
-    # Decode token to get user ID (using same logic as verify_token)
-    import jwt
-    from app.auth import SUPABASE_JWT_SECRET
-
-    try:
-        if not SUPABASE_JWT_SECRET:
-            # Development mode: decode without verification
-            payload = jwt.decode(token, options={"verify_signature": False})
-        else:
-            # Production: verify signature
-            payload = jwt.decode(
-                token,
-                SUPABASE_JWT_SECRET,
-                algorithms=["HS256"],
-                options={"verify_aud": False},
-            )
-
-        user_id_from_token = payload.get("sub")
-        if not user_id_from_token:
-            raise HTTPException(status_code=401, detail="Token missing 'sub' claim")
-
-        print(f"DEBUG: Got user_id from token: {user_id_from_token}")
-    except jwt.ExpiredSignatureError:
-        raise HTTPException(status_code=401, detail="Token has expired")
-    except jwt.InvalidTokenError as e:
-        raise HTTPException(status_code=401, detail=f"Invalid token: {str(e)}")
-
-    # Convert to UUID
-    try:
-        user_id = uuid.UUID(user_id_from_token)
-        print(f"DEBUG: Converted to UUID: {user_id}")
-    except Exception as e:
-        print(f"DEBUG: UUID conversion failed: {e}")
-        raise HTTPException(status_code=400, detail=f"Invalid user_id from token: {str(e)}")
-
-    # Auto-create user profile if doesn't exist
-    try:
-        print(f"DEBUG: Calling get_or_create_user with {str(user_id)}")
-        user = get_or_create_user(str(user_id))
-        print(f"DEBUG: Got user data: {user}")
-        return user  # Return raw dict for now
-    except Exception as e:
-        import traceback
-        print(f"DEBUG: Exception in get_or_create_user:")
-        traceback.print_exc()
-        raise HTTPException(status_code=500, detail=f"Failed to get/create user: {str(e)}")
-
-
 @app.get("/api/users/{user_id}", response_model=UserProfileResponse, tags=["Users"])
 async def get_user(
     user_id: uuid.UUID,
@@ -315,6 +238,31 @@ async def get_user(
 
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
+
+    return UserProfileResponse(**user)
+
+
+@app.get("/api/users/me", response_model=UserProfileResponse, tags=["Users"])
+async def get_current_user(
+    db: Database = Depends(get_database),
+    user_id_from_token: str = Depends(verify_token),
+):
+    """
+    Get current user's profile from JWT token.
+
+    Requires JWT authentication. User ID is extracted from the token.
+    User profile is auto-created on first request if it doesn't exist.
+
+    Returns:
+        User profile
+    """
+    try:
+        user_id = uuid.UUID(user_id_from_token)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid user_id from token")
+
+    # Auto-create user profile if doesn't exist
+    user = get_or_create_user(str(user_id))
 
     return UserProfileResponse(**user)
 

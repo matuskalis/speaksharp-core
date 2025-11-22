@@ -213,7 +213,7 @@ BEGIN
     'error',
     p_error_id,
     0.7,
-    NOW() + INTERVAL '1 day'
+    NOW()
   );
 
   UPDATE error_log SET recycled = TRUE, recycled_count = recycled_count + 1

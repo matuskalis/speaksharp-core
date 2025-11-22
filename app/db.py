@@ -156,6 +156,53 @@ class Database:
                 """, (level, user_id))
                 return cur.rowcount > 0
 
+    def update_user_profile(
+        self,
+        user_id: uuid.UUID,
+        level: Optional[str] = None,
+        native_language: Optional[str] = None
+    ) -> bool:
+        """
+        Update user profile fields.
+
+        Args:
+            user_id: User UUID
+            level: New CEFR level (optional)
+            native_language: New native language (optional)
+
+        Returns:
+            True if updated, False if user not found
+        """
+        # Build dynamic update query
+        updates = []
+        params = []
+
+        if level is not None:
+            updates.append("level = %s")
+            params.append(level)
+
+        if native_language is not None:
+            updates.append("native_language = %s")
+            params.append(native_language)
+
+        if not updates:
+            # No fields to update
+            return True
+
+        updates.append("updated_at = NOW()")
+        params.append(user_id)
+
+        query = f"""
+            UPDATE user_profiles
+            SET {', '.join(updates)}
+            WHERE user_id = %s
+        """
+
+        with self.get_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(query, params)
+                return cur.rowcount > 0
+
     # SRS Cards
 
     def create_srs_card(
@@ -205,7 +252,7 @@ class Database:
                     source,
                     source_id,
                     difficulty,
-                    datetime.now() + timedelta(days=1),
+                    datetime.now(),
                     psycopg.types.json.Json(metadata or {})
                 ))
                 return cur.fetchone()

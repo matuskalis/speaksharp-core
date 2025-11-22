@@ -64,13 +64,18 @@ class ASRClient:
                         print(f"⚠️  ASR call failed (attempt {attempt + 1}), retrying: {e}")
                     time.sleep(self.config.retry_delay * (attempt + 1))
                 else:
+                    # Log error with full traceback
+                    import traceback
+                    print(f"❌ ASR call failed after {self.config.retry_attempts} attempts: {e}")
                     if config.debug_mode:
-                        print(f"❌ ASR call failed after {self.config.retry_attempts} attempts: {e}")
-                    return self._stub_transcribe_file(file_path)
+                        traceback.print_exc()
+                    # Re-raise the exception instead of silently falling back to stub
+                    raise RuntimeError(f"ASR transcription failed after {self.config.retry_attempts} attempts: {e}") from e
 
-        return self._stub_transcribe_file(file_path)
+        # This should never be reached
+        raise RuntimeError("ASR transcription failed: unexpected code path")
 
-    def transcribe_bytes(self, audio_bytes: bytes, filename: str = "audio.mp3") -> ASRResult:
+    def transcribe_bytes(self, audio_bytes: bytes, filename: str = "audio.webm") -> ASRResult:
         """
         Transcribe audio bytes to text.
 
@@ -97,11 +102,16 @@ class ASRClient:
                         print(f"⚠️  ASR call failed (attempt {attempt + 1}), retrying: {e}")
                     time.sleep(self.config.retry_delay * (attempt + 1))
                 else:
+                    # Log error with full traceback
+                    import traceback
+                    print(f"❌ ASR call failed after {self.config.retry_attempts} attempts: {e}")
                     if config.debug_mode:
-                        print(f"❌ ASR call failed after {self.config.retry_attempts} attempts: {e}")
-                    return self._stub_transcribe_bytes(audio_bytes)
+                        traceback.print_exc()
+                    # Re-raise the exception instead of silently falling back to stub
+                    raise RuntimeError(f"ASR transcription failed after {self.config.retry_attempts} attempts: {e}") from e
 
-        return self._stub_transcribe_bytes(audio_bytes)
+        # This should never be reached
+        raise RuntimeError("ASR transcription failed: unexpected code path")
 
     def _transcribe_openai_file(self, file_path: str) -> ASRResult:
         """Transcribe using OpenAI Whisper API from file."""
@@ -126,29 +136,46 @@ class ASRClient:
             provider="openai"
         )
 
-    def _transcribe_openai_bytes(self, audio_bytes: bytes, filename: str) -> ASRResult:
+    def _transcribe_openai_bytes(self, audio_bytes: bytes, filename: str = "audio.webm") -> ASRResult:
         """Transcribe using OpenAI Whisper API from bytes."""
         if config.log_api_calls:
-            print(f"[{datetime.now()}] OpenAI Whisper API call: {len(audio_bytes)} bytes")
+            print(f"[{datetime.now()}] OpenAI Whisper API call: {len(audio_bytes)} bytes, filename: {filename}")
 
-        # OpenAI API expects a file-like object
+        # Save audio file for debugging
+        if config.debug_mode:
+            debug_path = "/tmp/debug_voice.webm"
+            with open(debug_path, 'wb') as f:
+                f.write(audio_bytes)
+            print(f"[{datetime.now()}] [ASR DEBUG] Saved audio bytes to {debug_path} ({len(audio_bytes)} bytes)")
+
+        # Create audio file object for Whisper API with proper filename
         from io import BytesIO
         audio_file = BytesIO(audio_bytes)
-        audio_file.name = filename
+        audio_file.name = filename  # IMPORTANT: .webm extension tells Whisper the format
 
-        response = self.client.audio.transcriptions.create(
-            model=self.config.model,
-            file=audio_file,
-            language=self.config.language,
-            response_format="verbose_json",
-            timeout=self.config.timeout
-        )
+        try:
+            response = self.client.audio.transcriptions.create(
+                model=self.config.model,
+                file=audio_file,
+            )
+        except Exception as e:
+            import traceback
+            print(f"[{datetime.now()}] ❌ Whisper transcription error: {e}")
+            if config.debug_mode:
+                traceback.print_exc()
+            raise
+
+        if config.debug_mode:
+            print(f"[{datetime.now()}] Whisper response text: {repr(response.text)}")
+            print(f"[{datetime.now()}] Whisper response length: {len(response.text)} chars")
+        elif config.log_api_calls:
+            print(f"[{datetime.now()}] Whisper response text: '{response.text}' ({len(response.text)} chars)")
 
         return ASRResult(
             text=response.text,
             confidence=None,
-            language=response.language if hasattr(response, 'language') else self.config.language,
-            duration=response.duration if hasattr(response, 'duration') else None,
+            language=self.config.language,
+            duration=None,
             words=None,
             provider="openai"
         )
