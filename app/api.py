@@ -782,6 +782,50 @@ async def get_weakest_skills(
 
 
 # ============================================================================
+# Streaks Endpoints
+# ============================================================================
+
+@app.get("/api/streaks/current", tags=["Streaks"])
+async def get_current_streak(
+    db: Database = Depends(get_database),
+    user_id_from_token: str = Depends(verify_token),
+):
+    """
+    Get current user's streak information.
+
+    Requires JWT authentication. User ID is extracted from the token.
+
+    Returns:
+    - current_streak: Current consecutive days streak
+    - longest_streak: Longest streak ever achieved
+    - last_active_date: Date of last activity
+    """
+    try:
+        user_id = uuid.UUID(user_id_from_token)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid user_id from token")
+
+    try:
+        streak_data = db.get_user_streak(user_id)
+
+        if streak_data is None:
+            # Return zeros if no data found
+            return {
+                "current_streak": 0,
+                "longest_streak": 0,
+                "last_active_date": None
+            }
+
+        return streak_data
+
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to get streak data: {str(e)}"
+        )
+
+
+# ============================================================================
 # Stats & Analytics Endpoints
 # ============================================================================
 

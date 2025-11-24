@@ -516,6 +516,44 @@ class Database:
                 )
                 return cur.fetchone()
 
+    # Streaks
+
+    def get_user_streak(self, user_id: uuid.UUID) -> Optional[Dict[str, Any]]:
+        """
+        Get user's current streak information.
+
+        Args:
+            user_id: User UUID
+
+        Returns:
+            Streak dict with current_streak, longest_streak, last_active_date or None if not found
+        """
+        with self.get_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    SELECT
+                        current_streak_days,
+                        longest_streak_days,
+                        last_activity_date
+                    FROM user_streaks
+                    WHERE user_id = %s
+                """, (user_id,))
+                result = cur.fetchone()
+
+                if result:
+                    return {
+                        "current_streak": result["current_streak_days"],
+                        "longest_streak": result["longest_streak_days"],
+                        "last_active_date": result["last_activity_date"].isoformat() if result["last_activity_date"] else None
+                    }
+
+                # If no streak record exists, return zeros
+                return {
+                    "current_streak": 0,
+                    "longest_streak": 0,
+                    "last_active_date": None
+                }
+
     # Skill Graph
 
     def update_skill_node(
