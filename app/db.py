@@ -554,6 +554,373 @@ class Database:
                     "last_active_date": None
                 }
 
+    # Achievements
+
+    def get_achievements(self) -> List[Dict[str, Any]]:
+        """
+        Get all available achievements.
+
+        Returns:
+            List of achievement dicts
+        """
+        with self.get_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    SELECT * FROM achievements
+                    ORDER BY category, points
+                """)
+                return cur.fetchall()
+
+    def get_user_achievements(self, user_id: uuid.UUID) -> List[Dict[str, Any]]:
+        """
+        Get user's unlocked achievements with details.
+
+        Args:
+            user_id: User UUID
+
+        Returns:
+            List of unlocked achievements with progress and unlock date
+        """
+        with self.get_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    SELECT
+                        a.*,
+                        ua.unlocked_at,
+                        ua.progress
+                    FROM user_achievements ua
+                    JOIN achievements a ON ua.achievement_id = a.achievement_id
+                    WHERE ua.user_id = %s
+                    ORDER BY ua.unlocked_at DESC
+                """, (user_id,))
+                return cur.fetchall()
+
+    def unlock_achievement(
+        self,
+        user_id: uuid.UUID,
+        achievement_key: str,
+        progress: float = 100.0
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Unlock an achievement for a user.
+
+        Args:
+            user_id: User UUID
+            achievement_key: Achievement key (e.g., "first_lesson")
+            progress: Progress percentage (default 100.0)
+
+        Returns:
+            Created user_achievement dict or None if already unlocked
+        """
+        with self.get_connection() as conn:
+            with conn.cursor() as cur:
+                # Get achievement_id from key
+                cur.execute("""
+                    SELECT achievement_id FROM achievements WHERE achievement_key = %s
+                """, (achievement_key,))
+                result = cur.fetchone()
+
+                if not result:
+                    return None
+
+                achievement_id = result['achievement_id']
+
+                # Try to insert (will fail if already exists due to UNIQUE constraint)
+                try:
+                    cur.execute("""
+                        INSERT INTO user_achievements (user_id, achievement_id, progress, unlocked_at)
+                        VALUES (%s, %s, %s, NOW())
+                        RETURNING *
+                    """, (user_id, achievement_id, progress))
+                    return cur.fetchone()
+                except Exception:
+                    # Already unlocked
+                    return None
+
+    def has_achievement(self, user_id: uuid.UUID, achievement_key: str) -> bool:
+        """
+        Check if user has unlocked a specific achievement.
+
+        Args:
+            user_id: User UUID
+            achievement_key: Achievement key
+
+        Returns:
+            True if unlocked, False otherwise
+        """
+        with self.get_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    SELECT 1
+                    FROM user_achievements ua
+                    JOIN achievements a ON ua.achievement_id = a.achievement_id
+                    WHERE ua.user_id = %s AND a.achievement_key = %s
+                """, (user_id, achievement_key))
+                return cur.fetchone() is not None
+
+    # Daily Goals
+
+    def get_daily_goal(self, user_id: uuid.UUID, goal_date: Optional[datetime] = None) -> Optional[Dict[str, Any]]:
+        """
+        Get daily goal for a specific date (defaults to today).
+
+        Args:
+            user_id: User UUID
+            goal_date: Date for the goal (defaults to today)
+
+        Returns:
+            Daily goal dict or None if not found
+        """
+        if goal_date is None:
+            goal_date = datetime.now().date()
+
+        with self.get_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    SELECT * FROM daily_goals
+                    WHERE user_id = %s AND goal_date = %s
+                """, (user_id, goal_date))
+                return cur.fetchone()
+
+    def create_or_update_daily_goal(
+        self,
+        user_id: uuid.UUID,
+        goal_date: Optional[datetime] = None,
+        target_study_minutes: Optional[int] = None,
+        target_lessons: Optional[int] = None,
+        target_reviews: Optional[int] = None,
+        target_drills: Optional[int] = None
+    ) -> Dict[str, Any]:
+        """
+        Create or update daily goal targets.
+
+        Args:
+            user_id: User UUID
+            goal_date: Date for the goal (defaults to today)
+            target_study_minutes: Target study time
+            target_lessons: Target lessons count
+            target_reviews: Target reviews count
+            target_drills: Target drills count
+
+        Returns:
+            Created/updated daily goal dict
+        """
+        if goal_date is None:
+            goal_date = datetime.now().date()
+
+        with self.get_connection() as conn:
+            with conn.cursor() as cur:
+                # Try to insert, update if exists
+                cur.execute("""
+                    INSERT INTO daily_goals (
+                        user_id, goal_date,
+                        target_study_minutes, target_lessons, target_reviews, target_drills
+                    )
+                    VALUES (%s, %s, %s, %s, %s, %s)
+                    ON CONFLICT (user_id, goal_date)
+                    DO UPDATE SET
+                        target_study_minutes = COALESCE(EXCLUDED.target_study_minutes, daily_goals.target_study_minutes),
+                        target_lessons = COALESCE(EXCLUDED.target_lessons, daily_goals.target_lessons),
+                        target_reviews = COALESCE(EXCLUDED.target_reviews, daily_goals.target_reviews),
+                        target_drills = COALESCE(EXCLUDED.target_drills, daily_goals.target_drills),
+                        updated_at = NOW()
+                    RETURNING *
+                """, (user_id, goal_date, target_study_minutes, target_lessons, target_reviews, target_drills))
+                return cur.fetchone()
+
+    def increment_daily_goal_progress(
+        self,
+        user_id: uuid.UUID,
+        goal_date: Optional[datetime] = None,
+        study_minutes: int = 0,
+        lessons: int = 0,
+        reviews: int = 0,
+        drills: int = 0
+    ) -> Dict[str, Any]:
+        """
+        Increment daily goal progress counters.
+
+        Args:
+            user_id: User UUID
+            goal_date: Date for the goal (defaults to today)
+            study_minutes: Minutes to add
+            lessons: Lessons to add
+            reviews: Reviews to add
+            drills: Drills to add
+
+        Returns:
+            Updated daily goal dict
+        """
+        if goal_date is None:
+            goal_date = datetime.now().date()
+
+        with self.get_connection() as conn:
+            with conn.cursor() as cur:
+                # Create goal if doesn't exist, then increment
+                cur.execute("""
+                    INSERT INTO daily_goals (user_id, goal_date)
+                    VALUES (%s, %s)
+                    ON CONFLICT (user_id, goal_date) DO NOTHING
+                """, (user_id, goal_date))
+
+                cur.execute("""
+                    UPDATE daily_goals
+                    SET
+                        actual_study_minutes = actual_study_minutes + %s,
+                        actual_lessons = actual_lessons + %s,
+                        actual_reviews = actual_reviews + %s,
+                        actual_drills = actual_drills + %s,
+                        updated_at = NOW()
+                    WHERE user_id = %s AND goal_date = %s
+                    RETURNING *
+                """, (study_minutes, lessons, reviews, drills, user_id, goal_date))
+
+                goal = cur.fetchone()
+
+                # Update completion percentage
+                if goal:
+                    total_progress = 0
+                    total_targets = 0
+
+                    for target_key, actual_key in [
+                        ('target_study_minutes', 'actual_study_minutes'),
+                        ('target_lessons', 'actual_lessons'),
+                        ('target_reviews', 'actual_reviews'),
+                        ('target_drills', 'actual_drills')
+                    ]:
+                        target = goal.get(target_key, 0)
+                        actual = goal.get(actual_key, 0)
+                        if target and target > 0:
+                            total_targets += 1
+                            total_progress += min(100, (actual / target) * 100)
+
+                    completion = (total_progress / total_targets) if total_targets > 0 else 0
+                    completed = completion >= 100
+
+                    cur.execute("""
+                        UPDATE daily_goals
+                        SET completion_percentage = %s, completed = %s
+                        WHERE user_id = %s AND goal_date = %s
+                        RETURNING *
+                    """, (completion, completed, user_id, goal_date))
+
+                    return cur.fetchone()
+
+                return goal
+
+    # Referrals
+
+    def get_or_create_referral_code(self, user_id: uuid.UUID) -> Dict[str, Any]:
+        """
+        Get user's referral code or create one if doesn't exist.
+
+        Args:
+            user_id: User UUID
+
+        Returns:
+            Referral code dict
+        """
+        with self.get_connection() as conn:
+            with conn.cursor() as cur:
+                # Check if user already has a code
+                cur.execute("""
+                    SELECT * FROM referral_codes WHERE user_id = %s AND is_active = TRUE
+                """, (user_id,))
+                existing = cur.fetchone()
+
+                if existing:
+                    return existing
+
+                # Generate unique code (user_id first 8 chars)
+                code = str(user_id).replace('-', '')[:8].upper()
+
+                cur.execute("""
+                    INSERT INTO referral_codes (user_id, code, is_active)
+                    VALUES (%s, %s, TRUE)
+                    ON CONFLICT (code) DO UPDATE SET code = EXCLUDED.code
+                    RETURNING *
+                """, (user_id, code))
+                return cur.fetchone()
+
+    def get_referral_stats(self, user_id: uuid.UUID) -> Dict[str, Any]:
+        """
+        Get user's referral statistics.
+
+        Args:
+            user_id: User UUID
+
+        Returns:
+            Dict with total_signups, total_conversions, and referral_code
+        """
+        with self.get_connection() as conn:
+            with conn.cursor() as cur:
+                # Get referral code
+                code_data = self.get_or_create_referral_code(user_id)
+
+                # Get conversion stats
+                cur.execute("""
+                    SELECT
+                        COUNT(*) as total_signups,
+                        COUNT(*) FILTER (WHERE converted = TRUE) as total_conversions
+                    FROM referral_conversions
+                    WHERE referrer_user_id = %s
+                """, (user_id,))
+                stats = cur.fetchone()
+
+                return {
+                    "referral_code": code_data['code'],
+                    "total_signups": stats['total_signups'] if stats else 0,
+                    "total_conversions": stats['total_conversions'] if stats else 0
+                }
+
+    def claim_referral_code(self, referred_user_id: uuid.UUID, referral_code: str) -> bool:
+        """
+        Claim a referral code for a new user.
+
+        Args:
+            referred_user_id: New user's UUID
+            referral_code: Referral code to claim
+
+        Returns:
+            True if successful, False otherwise
+        """
+        with self.get_connection() as conn:
+            with conn.cursor() as cur:
+                # Find referrer by code
+                cur.execute("""
+                    SELECT user_id FROM referral_codes WHERE code = %s AND is_active = TRUE
+                """, (referral_code,))
+                referrer = cur.fetchone()
+
+                if not referrer:
+                    return False
+
+                referrer_id = referrer['user_id']
+
+                # Don't allow self-referral
+                if referrer_id == referred_user_id:
+                    return False
+
+                try:
+                    # Create conversion record
+                    cur.execute("""
+                        INSERT INTO referral_conversions (
+                            referrer_user_id, referred_user_id, referral_code
+                        )
+                        VALUES (%s, %s, %s)
+                    """, (referrer_id, referred_user_id, referral_code))
+
+                    # Update total_signups counter
+                    cur.execute("""
+                        UPDATE referral_codes
+                        SET total_signups = total_signups + 1
+                        WHERE code = %s
+                    """, (referral_code,))
+
+                    return True
+                except Exception:
+                    return False
+
     # Skill Graph
 
     def update_skill_node(

@@ -826,6 +826,221 @@ async def get_current_streak(
 
 
 # ============================================================================
+# Achievements Endpoints
+# ============================================================================
+
+@app.get("/api/achievements", tags=["Achievements"])
+async def get_all_achievements(
+    db: Database = Depends(get_database),
+    user_id_from_token: str = Depends(verify_token),
+):
+    """
+    Get all available achievements.
+
+    Returns list of all achievements with their details.
+    """
+    try:
+        achievements = db.get_achievements()
+        return {"achievements": achievements, "count": len(achievements)}
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to get achievements: {str(e)}"
+        )
+
+
+@app.get("/api/achievements/mine", tags=["Achievements"])
+async def get_my_achievements(
+    db: Database = Depends(get_database),
+    user_id_from_token: str = Depends(verify_token),
+):
+    """
+    Get current user's unlocked achievements.
+
+    Returns list of achievements the user has unlocked.
+    """
+    try:
+        user_id = uuid.UUID(user_id_from_token)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid user_id from token")
+
+    try:
+        achievements = db.get_user_achievements(user_id)
+        return {"achievements": achievements, "count": len(achievements)}
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to get user achievements: {str(e)}"
+        )
+
+
+# ============================================================================
+# Daily Goals Endpoints
+# ============================================================================
+
+@app.get("/api/goals/today", tags=["Goals"])
+async def get_today_goal(
+    db: Database = Depends(get_database),
+    user_id_from_token: str = Depends(verify_token),
+):
+    """
+    Get today's daily goal for the authenticated user.
+
+    Returns the daily goal with targets and actual progress.
+    """
+    try:
+        user_id = uuid.UUID(user_id_from_token)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid user_id from token")
+
+    try:
+        goal = db.get_daily_goal(user_id)
+
+        if not goal:
+            # Create default goal if doesn't exist
+            goal = db.create_or_update_daily_goal(
+                user_id,
+                target_study_minutes=30,
+                target_lessons=1,
+                target_reviews=10,
+                target_drills=2
+            )
+
+        return goal
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to get daily goal: {str(e)}"
+        )
+
+
+@app.post("/api/goals/today", tags=["Goals"])
+async def update_today_goal(
+    payload: dict = Body(...),
+    db: Database = Depends(get_database),
+    user_id_from_token: str = Depends(verify_token),
+):
+    """
+    Update today's daily goal targets.
+
+    Payload can include: target_study_minutes, target_lessons, target_reviews, target_drills
+    """
+    try:
+        user_id = uuid.UUID(user_id_from_token)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid user_id from token")
+
+    try:
+        goal = db.create_or_update_daily_goal(
+            user_id,
+            target_study_minutes=payload.get("target_study_minutes"),
+            target_lessons=payload.get("target_lessons"),
+            target_reviews=payload.get("target_reviews"),
+            target_drills=payload.get("target_drills")
+        )
+
+        return goal
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to update daily goal: {str(e)}"
+        )
+
+
+# ============================================================================
+# Referrals Endpoints
+# ============================================================================
+
+@app.get("/api/referrals/my-code", tags=["Referrals"])
+async def get_my_referral_code(
+    db: Database = Depends(get_database),
+    user_id_from_token: str = Depends(verify_token),
+):
+    """
+    Get the authenticated user's referral code.
+
+    Creates a code if the user doesn't have one yet.
+    """
+    try:
+        user_id = uuid.UUID(user_id_from_token)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid user_id from token")
+
+    try:
+        code_data = db.get_or_create_referral_code(user_id)
+        return code_data
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to get referral code: {str(e)}"
+        )
+
+
+@app.get("/api/referrals/stats", tags=["Referrals"])
+async def get_referral_stats(
+    db: Database = Depends(get_database),
+    user_id_from_token: str = Depends(verify_token),
+):
+    """
+    Get the authenticated user's referral statistics.
+
+    Returns referral code, total signups, and conversions.
+    """
+    try:
+        user_id = uuid.UUID(user_id_from_token)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid user_id from token")
+
+    try:
+        stats = db.get_referral_stats(user_id)
+        return stats
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to get referral stats: {str(e)}"
+        )
+
+
+@app.post("/api/referrals/claim", tags=["Referrals"])
+async def claim_referral(
+    payload: dict = Body(...),
+    db: Database = Depends(get_database),
+    user_id_from_token: str = Depends(verify_token),
+):
+    """
+    Claim a referral code for the current user.
+
+    Payload: { "referral_code": "ABC12345" }
+    """
+    try:
+        user_id = uuid.UUID(user_id_from_token)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid user_id from token")
+
+    referral_code = payload.get("referral_code")
+    if not referral_code:
+        raise HTTPException(status_code=400, detail="Missing referral_code")
+
+    try:
+        success = db.claim_referral_code(user_id, referral_code)
+
+        if not success:
+            raise HTTPException(
+                status_code=400,
+                detail="Invalid referral code or already claimed"
+            )
+
+        return {"status": "success", "message": "Referral code claimed successfully"}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to claim referral: {str(e)}"
+        )
+
+
+# ============================================================================
 # Stats & Analytics Endpoints
 # ============================================================================
 
