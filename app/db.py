@@ -160,7 +160,10 @@ class Database:
         self,
         user_id: uuid.UUID,
         level: Optional[str] = None,
-        native_language: Optional[str] = None
+        native_language: Optional[str] = None,
+        full_name: Optional[str] = None,
+        country: Optional[str] = None,
+        onboarding_completed: Optional[bool] = None
     ) -> bool:
         """
         Update user profile fields.
@@ -169,6 +172,9 @@ class Database:
             user_id: User UUID
             level: New CEFR level (optional)
             native_language: New native language (optional)
+            full_name: User's full name (optional)
+            country: User's country (optional)
+            onboarding_completed: Whether onboarding is complete (optional)
 
         Returns:
             True if updated, False if user not found
@@ -184,6 +190,18 @@ class Database:
         if native_language is not None:
             updates.append("native_language = %s")
             params.append(native_language)
+
+        if full_name is not None:
+            updates.append("full_name = %s")
+            params.append(full_name)
+
+        if country is not None:
+            updates.append("country = %s")
+            params.append(country)
+
+        if onboarding_completed is not None:
+            updates.append("onboarding_completed = %s")
+            params.append(onboarding_completed)
 
         if not updates:
             # No fields to update

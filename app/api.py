@@ -101,6 +101,9 @@ class UpdateProfileRequest(BaseModel):
     """Request model for updating user profile."""
     level: Optional[str] = None
     native_language: Optional[str] = None
+    full_name: Optional[str] = None
+    country: Optional[str] = None
+    onboarding_completed: Optional[bool] = None
 
 
 class HealthResponse(BaseModel):
@@ -349,7 +352,10 @@ async def update_current_user_profile(
         success = db.update_user_profile(
             user_id=user_id,
             level=request.level,
-            native_language=request.native_language
+            native_language=request.native_language,
+            full_name=request.full_name,
+            country=request.country,
+            onboarding_completed=request.onboarding_completed
         )
 
         if not success:
