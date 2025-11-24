@@ -157,6 +157,9 @@ class ASRClient:
             response = self.client.audio.transcriptions.create(
                 model=self.config.model,
                 file=audio_file,
+                language=self.config.language,
+                response_format="verbose_json",
+                timeout=self.config.timeout
             )
         except Exception as e:
             import traceback
@@ -173,10 +176,10 @@ class ASRClient:
 
         return ASRResult(
             text=response.text,
-            confidence=None,
-            language=self.config.language,
-            duration=None,
-            words=None,
+            confidence=None,  # Whisper doesn't provide overall confidence
+            language=response.language if hasattr(response, 'language') else self.config.language,
+            duration=response.duration if hasattr(response, 'duration') else None,
+            words=None,  # Could parse segments if needed
             provider="openai"
         )
 
