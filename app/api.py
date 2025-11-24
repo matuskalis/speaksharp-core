@@ -24,6 +24,7 @@ from app.voice_session import VoiceSession
 from app.config import load_config
 from app.models import TutorResponse
 from app.auth import verify_token, get_or_create_user
+from app.version import VERSION
 
 
 # Pydantic Models for API
@@ -111,6 +112,7 @@ class HealthResponse(BaseModel):
     status: str
     database: str
     timestamp: datetime
+    version: str
 
 
 # Application lifecycle
@@ -185,7 +187,8 @@ async def health_check(db: Database = Depends(get_database)):
     return HealthResponse(
         status="healthy" if db_status == "healthy" else "degraded",
         database=db_status,
-        timestamp=datetime.now()
+        timestamp=datetime.now(),
+        version=VERSION
     )
 
 
