@@ -83,8 +83,15 @@ class UserProfileResponse(BaseModel):
     user_id: uuid.UUID
     level: str
     native_language: Optional[str]
-    goals: Dict[str, Any]
+    goals: List[str]
     interests: List[str]
+    daily_time_goal: Optional[int]
+    onboarding_completed: bool
+    full_name: Optional[str]
+    trial_start_date: Optional[datetime]
+    trial_end_date: Optional[datetime]
+    subscription_status: Optional[str]
+    subscription_tier: Optional[str]
     created_at: datetime
     updated_at: datetime
 
@@ -102,9 +109,16 @@ class UpdateProfileRequest(BaseModel):
     """Request model for updating user profile."""
     level: Optional[str] = None
     native_language: Optional[str] = None
+    goals: Optional[List[str]] = None
+    interests: Optional[List[str]] = None
+    daily_time_goal: Optional[int] = None
     full_name: Optional[str] = None
     country: Optional[str] = None
     onboarding_completed: Optional[bool] = None
+    trial_start_date: Optional[datetime] = None
+    trial_end_date: Optional[datetime] = None
+    subscription_status: Optional[str] = None
+    subscription_tier: Optional[str] = None
 
 
 class HealthResponse(BaseModel):
@@ -356,9 +370,16 @@ async def update_current_user_profile(
             user_id=user_id,
             level=request.level,
             native_language=request.native_language,
+            goals=request.goals,
+            interests=request.interests,
+            daily_time_goal=request.daily_time_goal,
             full_name=request.full_name,
             country=request.country,
-            onboarding_completed=request.onboarding_completed
+            onboarding_completed=request.onboarding_completed,
+            trial_start_date=request.trial_start_date,
+            trial_end_date=request.trial_end_date,
+            subscription_status=request.subscription_status,
+            subscription_tier=request.subscription_tier
         )
 
         if not success:
@@ -478,6 +499,53 @@ async def tutor_text(
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Tutor text error: {e}")
+
+@app.post("/api/demo/grammar", tags=["Demo"])
+async def demo_grammar(payload: dict = Body(...)):
+    """
+    Public demo endpoint for grammar checking.
+
+    Does NOT require authentication. Used for landing page interactive demo.
+    Does NOT log errors or create SRS cards.
+
+    Returns grammar corrections for the provided text.
+    """
+    try:
+        # Extract text from payload
+        text = payload.get("text")
+        if not isinstance(text, str) or not text.strip():
+            raise HTTPException(status_code=400, detail="Invalid or missing text")
+
+        # Run tutor agent with beginner level (A1) for demo
+        tutor = TutorAgent()
+        tutor_response: TutorResponse = tutor.process_user_input(
+            text,
+            context={
+                "source": "demo",
+                "mode": "text",
+                "level": "A1",
+            },
+        )
+
+        # Return only the corrected text and explanation
+        # Format matches the demo's expected structure
+        if tutor_response.errors:
+            first_error = tutor_response.errors[0]
+            return {
+                "corrected": first_error.corrected_sentence,
+                "explanation": first_error.explanation,
+            }
+        else:
+            return {
+                "corrected": text,
+                "explanation": "Great! No errors found.",
+            }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Demo grammar error: {e}")
+
 
 @app.post("/api/tutor/voice", tags=["Tutor"])
 async def tutor_voice(
