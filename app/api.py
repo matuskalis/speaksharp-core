@@ -23,8 +23,9 @@ from app.tutor_agent import TutorAgent
 from app.voice_session import VoiceSession
 from app.config import load_config
 from app.models import TutorResponse
-from app.auth import verify_token, get_or_create_user
+from app.auth import verify_token, optional_verify_token, get_or_create_user
 from app.version import VERSION
+from app.pronunciation import router as pronunciation_router
 
 
 # Pydantic Models for API
@@ -166,6 +167,9 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# Register routers
+app.include_router(pronunciation_router, prefix="/api", tags=["Pronunciation"])
 
 
 # Dependency injection
@@ -1878,7 +1882,7 @@ async def get_placement_test_questions():
 async def submit_placement_test(
     payload: dict,
     db: Database = Depends(get_database),
-    user_id_from_token: str = Depends(verify_token),
+    user_id_from_token: Optional[str] = Depends(optional_verify_token),
 ):
     """
     Submit placement test answers and get results.
@@ -1889,6 +1893,9 @@ async def submit_placement_test(
     }
 
     Returns level determination and feedback.
+
+    Auth is optional - if authenticated, saves level to user profile.
+    If not authenticated (during onboarding), just returns results.
     """
     from app.placement_test import placement_evaluator
 
@@ -1900,17 +1907,18 @@ async def submit_placement_test(
     # Evaluate the test
     result = placement_evaluator.evaluate_test(answers)
 
-    # Update user's level in database
-    try:
-        user_id = uuid.UUID(user_id_from_token)
-    except Exception:
-        raise HTTPException(status_code=400, detail="Invalid user_id from token")
-
-    # Update user profile with determined level
-    db.update_user_profile(
-        user_id=user_id,
-        level=result.level
-    )
+    # Update user's level in database if authenticated
+    if user_id_from_token:
+        try:
+            user_id = uuid.UUID(user_id_from_token)
+            # Update user profile with determined level
+            db.update_user_profile(
+                user_id=user_id,
+                level=result.level
+            )
+        except Exception as e:
+            # Don't fail the request if DB update fails
+            print(f"Warning: Failed to update user profile: {e}")
 
     return {
         "level": result.level,

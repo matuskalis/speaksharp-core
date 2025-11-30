@@ -71,6 +71,61 @@ def verify_token(authorization: Optional[str] = Header(None)) -> str:
         raise HTTPException(status_code=401, detail=f"Invalid token: {str(e)}")
 
 
+def optional_verify_token(authorization: Optional[str] = Header(None)) -> Optional[str]:
+    """
+    Optionally verify JWT token and extract user ID.
+
+    Returns None if no authorization header is provided (instead of raising error).
+    Useful for endpoints that can work with or without authentication.
+
+    Args:
+        authorization: Authorization header with format "Bearer {token}"
+
+    Returns:
+        User ID (UUID as string) from the token's 'sub' claim, or None if not authenticated
+
+    Raises:
+        HTTPException: If token is provided but invalid or expired
+    """
+    if not authorization:
+        return None
+
+    # If token is provided, verify it (reuse logic from verify_token)
+    parts = authorization.split()
+    if len(parts) != 2 or parts[0].lower() != "bearer":
+        raise HTTPException(status_code=401, detail="Invalid authorization header format")
+
+    token = parts[1]
+
+    if not SUPABASE_JWT_SECRET:
+        # In development, skip verification if JWT secret not configured
+        try:
+            payload = jwt.decode(token, options={"verify_signature": False})
+            user_id = payload.get("sub")
+            if not user_id:
+                raise HTTPException(status_code=401, detail="Token missing 'sub' claim")
+            return user_id
+        except Exception as e:
+            raise HTTPException(status_code=401, detail=f"Invalid token: {str(e)}")
+
+    # Production: Verify token signature
+    try:
+        payload = jwt.decode(
+            token,
+            SUPABASE_JWT_SECRET,
+            algorithms=["HS256"],
+            options={"verify_aud": False},
+        )
+        user_id = payload.get("sub")
+        if not user_id:
+            raise HTTPException(status_code=401, detail="Token missing 'sub' claim")
+        return user_id
+    except jwt.ExpiredSignatureError:
+        raise HTTPException(status_code=401, detail="Token has expired")
+    except jwt.InvalidTokenError as e:
+        raise HTTPException(status_code=401, detail=f"Invalid token: {str(e)}")
+
+
 def get_or_create_user(user_id: str, level: str = "A1") -> dict:
     """
     Get user profile or create if doesn't exist.
