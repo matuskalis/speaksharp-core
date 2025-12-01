@@ -141,6 +141,21 @@ async def lifespan(app: FastAPI):
     db = get_db()
     if db.health_check():
         print("✓ Database connection successful")
+
+        # Run migrations
+        print("🔧 Running database migrations...")
+        try:
+            conn = db.get_connection()
+            with conn.cursor() as cur:
+                # Migration 005: Add daily_time_goal column
+                cur.execute("""
+                    ALTER TABLE user_profiles
+                    ADD COLUMN IF NOT EXISTS daily_time_goal INTEGER
+                """)
+                conn.commit()
+            print("✓ Migrations completed successfully")
+        except Exception as e:
+            print(f"⚠️  Migration warning: {e}")
     else:
         print("⚠️  Database connection failed - some features may not work")
 
