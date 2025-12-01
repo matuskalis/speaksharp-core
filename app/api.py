@@ -147,10 +147,14 @@ async def lifespan(app: FastAPI):
         try:
             with db.get_connection() as conn:
                 with conn.cursor() as cur:
-                    # Migration 005: Add daily_time_goal column
+                    # Migration: Add all onboarding and subscription columns
                     cur.execute("""
                         ALTER TABLE user_profiles
-                        ADD COLUMN IF NOT EXISTS daily_time_goal INTEGER
+                        ADD COLUMN IF NOT EXISTS daily_time_goal INTEGER,
+                        ADD COLUMN IF NOT EXISTS trial_start_date TIMESTAMPTZ,
+                        ADD COLUMN IF NOT EXISTS trial_end_date TIMESTAMPTZ,
+                        ADD COLUMN IF NOT EXISTS subscription_status TEXT,
+                        ADD COLUMN IF NOT EXISTS subscription_tier TEXT
                     """)
                     conn.commit()
             print("✓ Migrations completed successfully")
