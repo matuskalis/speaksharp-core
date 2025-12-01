@@ -42,3 +42,7 @@ flake8==6.1.0
 # JWT for auth
 pyjwt==2.9.0
 cryptography==44.0.0
+
+# Pronunciation scoring
+phonemizer==3.2.1
+numpy==1.26.4

@@ -161,9 +161,16 @@ class Database:
         user_id: uuid.UUID,
         level: Optional[str] = None,
         native_language: Optional[str] = None,
+        goals: Optional[List[str]] = None,
+        interests: Optional[List[str]] = None,
+        daily_time_goal: Optional[int] = None,
         full_name: Optional[str] = None,
         country: Optional[str] = None,
-        onboarding_completed: Optional[bool] = None
+        onboarding_completed: Optional[bool] = None,
+        trial_start_date: Optional[datetime] = None,
+        trial_end_date: Optional[datetime] = None,
+        subscription_status: Optional[str] = None,
+        subscription_tier: Optional[str] = None
     ) -> bool:
         """
         Update user profile fields.
@@ -172,9 +179,16 @@ class Database:
             user_id: User UUID
             level: New CEFR level (optional)
             native_language: New native language (optional)
+            goals: User learning goals (optional)
+            interests: User interests (optional)
+            daily_time_goal: Daily time goal in minutes (optional)
             full_name: User's full name (optional)
             country: User's country (optional)
             onboarding_completed: Whether onboarding is complete (optional)
+            trial_start_date: Trial start date (optional)
+            trial_end_date: Trial end date (optional)
+            subscription_status: Subscription status (optional)
+            subscription_tier: Subscription tier (optional)
 
         Returns:
             True if updated, False if user not found
@@ -191,6 +205,18 @@ class Database:
             updates.append("native_language = %s")
             params.append(native_language)
 
+        if goals is not None:
+            updates.append("goals = %s")
+            params.append(psycopg.types.json.Json(goals))
+
+        if interests is not None:
+            updates.append("interests = %s")
+            params.append(psycopg.types.json.Json(interests))
+
+        if daily_time_goal is not None:
+            updates.append("daily_time_goal = %s")
+            params.append(daily_time_goal)
+
         if full_name is not None:
             updates.append("full_name = %s")
             params.append(full_name)
@@ -202,6 +228,22 @@ class Database:
         if onboarding_completed is not None:
             updates.append("onboarding_completed = %s")
             params.append(onboarding_completed)
+
+        if trial_start_date is not None:
+            updates.append("trial_start_date = %s")
+            params.append(trial_start_date)
+
+        if trial_end_date is not None:
+            updates.append("trial_end_date = %s")
+            params.append(trial_end_date)
+
+        if subscription_status is not None:
+            updates.append("subscription_status = %s")
+            params.append(subscription_status)
+
+        if subscription_tier is not None:
+            updates.append("subscription_tier = %s")
+            params.append(subscription_tier)
 
         if not updates:
             # No fields to update
