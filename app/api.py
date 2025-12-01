@@ -25,7 +25,7 @@ from app.config import load_config
 from app.models import TutorResponse
 from app.auth import verify_token, optional_verify_token, get_or_create_user
 from app.version import VERSION
-from app.pronunciation import router as pronunciation_router
+# from app.pronunciation import router as pronunciation_router  # Temporarily disabled
 
 
 # Pydantic Models for API
@@ -188,7 +188,7 @@ app.add_middleware(
 )
 
 # Register routers
-app.include_router(pronunciation_router, prefix="/api", tags=["Pronunciation"])
+# app.include_router(pronunciation_router, prefix="/api", tags=["Pronunciation"])  # Temporarily disabled
 
 
 # Dependency injection
