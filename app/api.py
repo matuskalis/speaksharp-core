@@ -145,14 +145,14 @@ async def lifespan(app: FastAPI):
         # Run migrations
         print("🔧 Running database migrations...")
         try:
-            conn = db.get_connection()
-            with conn.cursor() as cur:
-                # Migration 005: Add daily_time_goal column
-                cur.execute("""
-                    ALTER TABLE user_profiles
-                    ADD COLUMN IF NOT EXISTS daily_time_goal INTEGER
-                """)
-                conn.commit()
+            with db.get_connection() as conn:
+                with conn.cursor() as cur:
+                    # Migration 005: Add daily_time_goal column
+                    cur.execute("""
+                        ALTER TABLE user_profiles
+                        ADD COLUMN IF NOT EXISTS daily_time_goal INTEGER
+                    """)
+                    conn.commit()
             print("✓ Migrations completed successfully")
         except Exception as e:
             print(f"⚠️  Migration warning: {e}")
