@@ -131,6 +131,7 @@ def get_or_create_user(user_id: str, level: str = "A1") -> dict:
     Get user profile or create if doesn't exist.
 
     This enables seamless onboarding - users are auto-created on first API call.
+    New users automatically get a 14-day free trial.
 
     Args:
         user_id: User UUID from JWT token
@@ -140,6 +141,7 @@ def get_or_create_user(user_id: str, level: str = "A1") -> dict:
         User profile dict
     """
     import uuid
+    from datetime import datetime, timedelta
     db = get_db()
 
     # Convert string to UUID
@@ -150,7 +152,10 @@ def get_or_create_user(user_id: str, level: str = "A1") -> dict:
     if user:
         return user
 
-    # Create new user with defaults
+    # Create new user with defaults and 14-day trial
+    trial_start = datetime.now()
+    trial_end = trial_start + timedelta(days=14)
+
     user = db.create_user(
         user_id=user_uuid,
         level=level,
@@ -159,4 +164,68 @@ def get_or_create_user(user_id: str, level: str = "A1") -> dict:
         interests=[],
     )
 
+    # Set trial dates for new user
+    db.update_user_profile(
+        user_id=user_uuid,
+        trial_start_date=trial_start,
+        trial_end_date=trial_end,
+    )
+
+    # Fetch updated user profile
+    user = db.get_user(user_uuid)
+
     return user
+
+
+def add_user_xp(user_id: str, amount: int) -> int:
+    """
+    Add XP to a user's total and return new total.
+
+    Args:
+        user_id: User UUID from JWT token
+        amount: Amount of XP to add
+
+    Returns:
+        New total XP
+    """
+    import uuid
+    db = get_db()
+    user_uuid = uuid.UUID(user_id)
+
+    with db.get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                UPDATE user_profiles
+                SET total_xp = COALESCE(total_xp, 0) + %s,
+                    updated_at = NOW()
+                WHERE user_id = %s
+                RETURNING total_xp
+            """, (amount, user_uuid))
+            result = cur.fetchone()
+            conn.commit()
+            return result['total_xp'] if result else 0
+
+
+def get_user_xp(user_id: str) -> int:
+    """
+    Get user's total XP.
+
+    Args:
+        user_id: User UUID from JWT token
+
+    Returns:
+        Total XP
+    """
+    import uuid
+    db = get_db()
+    user_uuid = uuid.UUID(user_id)
+
+    with db.get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT COALESCE(total_xp, 0) as total_xp
+                FROM user_profiles
+                WHERE user_id = %s
+            """, (user_uuid,))
+            result = cur.fetchone()
+            return result['total_xp'] if result else 0

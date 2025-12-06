@@ -36,12 +36,23 @@ class Error(BaseModel):
     explanation: str
 
 
+class PronunciationFeedbackItem(BaseModel):
+    """Pronunciation feedback for display in tutor response."""
+    word: str
+    score: float
+    issue: str
+    tip: str
+    phonetic: Optional[str] = None
+    example: Optional[str] = None
+
+
 class TutorResponse(BaseModel):
     message: str
     errors: List[Error] = []
     micro_task: Optional[str] = None
     scenario_complete: Optional[bool] = None
     success_evaluation: Optional[str] = None
+    pronunciation_feedback: Optional[Dict[str, Any]] = None  # Pronunciation analysis
 
 
 class ScenarioTemplate(BaseModel):

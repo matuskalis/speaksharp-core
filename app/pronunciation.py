@@ -10,6 +10,7 @@ import psycopg
 from app.db import Database, get_db
 from app.auth import verify_token
 from app.pronunciation_scorer import PronunciationScorer
+from app.pronunciation_analyzer import PronunciationAnalyzer
 from app.data.practice_phrases import PRACTICE_PHRASES
 
 router = APIRouter()
@@ -225,3 +226,21 @@ async def get_summary(
         "last_7d_attempts": last_7d_attempts,
         "weakest_phonemes": weakest_phonemes,
     }
+
+
+@router.get("/pronunciation/stats")
+async def get_pronunciation_stats(
+    db: Database = Depends(get_db),
+    user_id_from_token: str = Depends(verify_token),
+) -> Dict[str, Any]:
+    """
+    Get comprehensive pronunciation statistics with improvement tracking.
+
+    Returns detailed analytics including:
+    - Overall progress and trends
+    - Most improved words/phonemes
+    - Areas needing work
+    - Personalized practice recommendations
+    """
+    analyzer = PronunciationAnalyzer(db=db)
+    return analyzer.get_pronunciation_stats(user_id_from_token)

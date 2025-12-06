@@ -14,7 +14,7 @@ from typing import Optional, List, Dict, Any
 from datetime import datetime
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, HTTPException, Depends, File, UploadFile, Header, Request
+from fastapi import FastAPI, HTTPException, Depends, File, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
@@ -26,13 +26,7 @@ from app.tutor_agent import TutorAgent
 from app.voice_session import VoiceSession
 from app.config import load_config
 from app.models import TutorResponse
-from app.auth import verify_token, optional_verify_token, get_or_create_user
-from app.version import VERSION
-from app.payments import StripePaymentService
-# from app.pronunciation import router as pronunciation_router  # Temporarily disabled
-
-import stripe
-import os
+from app.auth import verify_token, get_or_create_user
 
 
 # Pydantic Models for API
@@ -90,16 +84,17 @@ class UserProfileResponse(BaseModel):
     """Response model for user profile."""
     user_id: uuid.UUID
     level: str
-    native_language: Optional[str]
-    goals: List[str]
-    interests: List[str]
-    daily_time_goal: Optional[int]
-    onboarding_completed: bool
-    full_name: Optional[str]
-    trial_start_date: Optional[datetime]
-    trial_end_date: Optional[datetime]
-    subscription_status: Optional[str]
-    subscription_tier: Optional[str]
+    native_language: Optional[str] = None
+    goals: Optional[List[str]] = None
+    interests: Optional[List[str]] = None
+    daily_time_goal: Optional[int] = None
+    onboarding_completed: bool = False
+    full_name: Optional[str] = None
+    trial_start_date: Optional[datetime] = None
+    trial_end_date: Optional[datetime] = None
+    subscription_status: Optional[str] = None
+    subscription_tier: Optional[str] = None
+    is_tester: bool = False
     created_at: datetime
     updated_at: datetime
 
@@ -109,7 +104,7 @@ class CreateUserRequest(BaseModel):
     user_id: Optional[uuid.UUID] = None
     level: str = "A1"
     native_language: Optional[str] = None
-    goals: Optional[Dict[str, Any]] = None
+    goals: Optional[List[str]] = None
     interests: Optional[List[str]] = None
 
 
@@ -117,16 +112,24 @@ class UpdateProfileRequest(BaseModel):
     """Request model for updating user profile."""
     level: Optional[str] = None
     native_language: Optional[str] = None
-    goals: Optional[List[str]] = None
-    interests: Optional[List[str]] = None
-    daily_time_goal: Optional[int] = None
-    full_name: Optional[str] = None
-    country: Optional[str] = None
-    onboarding_completed: Optional[bool] = None
-    trial_start_date: Optional[datetime] = None
-    trial_end_date: Optional[datetime] = None
-    subscription_status: Optional[str] = None
-    subscription_tier: Optional[str] = None
+
+
+class VoicePreferences(BaseModel):
+    """Voice preferences model."""
+    voice: str = "alloy"
+    speech_speed: float = 1.0
+    auto_play_responses: bool = True
+    show_transcription: bool = True
+    microphone_sensitivity: float = 0.5
+
+
+class UpdateVoicePreferencesRequest(BaseModel):
+    """Request model for updating voice preferences."""
+    voice: Optional[str] = None
+    speech_speed: Optional[float] = None
+    auto_play_responses: Optional[bool] = None
+    show_transcription: Optional[bool] = None
+    microphone_sensitivity: Optional[float] = None
 
 
 class HealthResponse(BaseModel):
@@ -134,57 +137,42 @@ class HealthResponse(BaseModel):
     status: str
     database: str
     timestamp: datetime
-    version: str
-
-
-# Payment Models
-
-class CreateCheckoutSessionRequest(BaseModel):
-    """Request model for creating Stripe checkout session."""
-    price_id: str
-    success_url: str
-    cancel_url: str
-
-
-class CheckoutSessionResponse(BaseModel):
-    """Response model for checkout session."""
-    session_id: str
-    checkout_url: str
-
-
-class PortalSessionRequest(BaseModel):
-    """Request model for creating customer portal session."""
-    return_url: str
-
-
-class PortalSessionResponse(BaseModel):
-    """Response model for portal session."""
-    portal_url: str
-
-
-class SubscriptionStatusResponse(BaseModel):
-    """Response model for subscription status."""
-    status: str
-    tier: str
-    message: Optional[str] = None
-    subscription_id: Optional[str] = None
-    billing_cycle: Optional[str] = None
-    price_cents: Optional[int] = None
-    currency: Optional[str] = None
-    current_period_start: Optional[str] = None
-    current_period_end: Optional[str] = None
-    cancelled_at: Optional[str] = None
-    trial_start: Optional[str] = None
-    trial_end: Optional[str] = None
-    will_renew: Optional[bool] = None
-
-
-class CancelSubscriptionRequest(BaseModel):
-    """Request model for cancelling subscription."""
-    reason: Optional[str] = None
 
 
 # Application lifecycle
+
+
+def run_migrations(db):
+    """Run database migrations on startup."""
+    try:
+        with db.get_connection() as conn:
+            with conn.cursor() as cur:
+                # Migration 006: Add onboarding_completed and full_name
+                cur.execute("""
+                    ALTER TABLE user_profiles
+                    ADD COLUMN IF NOT EXISTS onboarding_completed BOOLEAN DEFAULT FALSE;
+                """)
+                cur.execute("""
+                    ALTER TABLE user_profiles
+                    ADD COLUMN IF NOT EXISTS full_name VARCHAR(255);
+                """)
+                # Set existing users as having completed onboarding
+                cur.execute("""
+                    UPDATE user_profiles
+                    SET onboarding_completed = TRUE
+                    WHERE onboarding_completed IS NULL OR onboarding_completed = FALSE;
+                """)
+
+                # Migration 007: Add voice preferences
+                cur.execute("""
+                    ALTER TABLE user_profiles
+                    ADD COLUMN IF NOT EXISTS voice_preferences JSONB DEFAULT '{"voice": "alloy", "speech_speed": 1.0, "auto_play_responses": true, "show_transcription": true, "microphone_sensitivity": 0.5}'::jsonb;
+                """)
+
+                conn.commit()
+                print("✓ Database migrations applied")
+    except Exception as e:
+        print(f"⚠️  Migration error (may already exist): {e}")
 
 
 @asynccontextmanager
@@ -195,25 +183,7 @@ async def lifespan(app: FastAPI):
     db = get_db()
     if db.health_check():
         print("✓ Database connection successful")
-
-        # Run migrations
-        print("🔧 Running database migrations...")
-        try:
-            with db.get_connection() as conn:
-                with conn.cursor() as cur:
-                    # Migration: Add all onboarding and subscription columns
-                    cur.execute("""
-                        ALTER TABLE user_profiles
-                        ADD COLUMN IF NOT EXISTS daily_time_goal INTEGER,
-                        ADD COLUMN IF NOT EXISTS trial_start_date TIMESTAMPTZ,
-                        ADD COLUMN IF NOT EXISTS trial_end_date TIMESTAMPTZ,
-                        ADD COLUMN IF NOT EXISTS subscription_status TEXT,
-                        ADD COLUMN IF NOT EXISTS subscription_tier TEXT
-                    """)
-                    conn.commit()
-            print("✓ Migrations completed successfully")
-        except Exception as e:
-            print(f"⚠️  Migration warning: {e}")
+        run_migrations(db)
     else:
         print("⚠️  Database connection failed - some features may not work")
 
@@ -240,9 +210,6 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
-# Register routers
-# app.include_router(pronunciation_router, prefix="/api", tags=["Pronunciation"])  # Temporarily disabled
 
 
 # Dependency injection
@@ -278,8 +245,7 @@ async def health_check(db: Database = Depends(get_database)):
     return HealthResponse(
         status="healthy" if db_status == "healthy" else "degraded",
         database=db_status,
-        timestamp=datetime.now(),
-        version=VERSION
+        timestamp=datetime.now()
     )
 
 
@@ -317,10 +283,10 @@ async def create_user(
         raise HTTPException(status_code=500, detail=f"Failed to create user: {str(e)}")
 
 
-@app.get("/api/users/me", tags=["Users"])
+@app.get("/api/users/me", response_model=UserProfileResponse, tags=["Users"])
 async def get_current_user(
-    request: Request,
     db: Database = Depends(get_database),
+    user_id_from_token: str = Depends(verify_token),
 ):
     """
     Get current user's profile from JWT token.
@@ -331,67 +297,15 @@ async def get_current_user(
     Returns:
         User profile
     """
-    # Manually extract authorization header from request
-    authorization = request.headers.get("authorization")
-    print(f"DEBUG: get_current_user called with authorization={authorization[:50] if authorization else 'None'}")
-
-    # Verify token and get user ID
-    if not authorization:
-        raise HTTPException(status_code=401, detail="Missing authorization header")
-
-    # Extract token from "Bearer {token}" format
-    parts = authorization.split()
-    if len(parts) != 2 or parts[0].lower() != "bearer":
-        raise HTTPException(status_code=401, detail="Invalid authorization header format")
-
-    token = parts[1]
-
-    # Decode token to get user ID (using same logic as verify_token)
-    import jwt
-    from app.auth import SUPABASE_JWT_SECRET
-
-    try:
-        if not SUPABASE_JWT_SECRET:
-            # Development mode: decode without verification
-            payload = jwt.decode(token, options={"verify_signature": False})
-        else:
-            # Production: verify signature
-            payload = jwt.decode(
-                token,
-                SUPABASE_JWT_SECRET,
-                algorithms=["HS256"],
-                options={"verify_aud": False},
-            )
-
-        user_id_from_token = payload.get("sub")
-        if not user_id_from_token:
-            raise HTTPException(status_code=401, detail="Token missing 'sub' claim")
-
-        print(f"DEBUG: Got user_id from token: {user_id_from_token}")
-    except jwt.ExpiredSignatureError:
-        raise HTTPException(status_code=401, detail="Token has expired")
-    except jwt.InvalidTokenError as e:
-        raise HTTPException(status_code=401, detail=f"Invalid token: {str(e)}")
-
-    # Convert to UUID
     try:
         user_id = uuid.UUID(user_id_from_token)
-        print(f"DEBUG: Converted to UUID: {user_id}")
-    except Exception as e:
-        print(f"DEBUG: UUID conversion failed: {e}")
-        raise HTTPException(status_code=400, detail=f"Invalid user_id from token: {str(e)}")
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid user_id from token")
 
     # Auto-create user profile if doesn't exist
-    try:
-        print(f"DEBUG: Calling get_or_create_user with {str(user_id)}")
-        user = get_or_create_user(str(user_id))
-        print(f"DEBUG: Got user data: {user}")
-        return user  # Return raw dict for now
-    except Exception as e:
-        import traceback
-        print(f"DEBUG: Exception in get_or_create_user:")
-        traceback.print_exc()
-        raise HTTPException(status_code=500, detail=f"Failed to get/create user: {str(e)}")
+    user = get_or_create_user(str(user_id))
+
+    return UserProfileResponse(**user)
 
 
 @app.get("/api/users/{user_id}", response_model=UserProfileResponse, tags=["Users"])
@@ -446,17 +360,7 @@ async def update_current_user_profile(
         success = db.update_user_profile(
             user_id=user_id,
             level=request.level,
-            native_language=request.native_language,
-            goals=request.goals,
-            interests=request.interests,
-            daily_time_goal=request.daily_time_goal,
-            full_name=request.full_name,
-            country=request.country,
-            onboarding_completed=request.onboarding_completed,
-            trial_start_date=request.trial_start_date,
-            trial_end_date=request.trial_end_date,
-            subscription_status=request.subscription_status,
-            subscription_tier=request.subscription_tier
+            native_language=request.native_language
         )
 
         if not success:
@@ -479,6 +383,75 @@ async def update_current_user_profile(
 
 
 from fastapi import Body
+
+def build_rich_tutor_context(
+    db: Database,
+    user_id: uuid.UUID,
+    user: dict,
+    scenario_id: Optional[str] = None,
+    session_id: Optional[uuid.UUID] = None,
+    context_str: Optional[str] = None,
+    turn_number: int = 1,
+) -> dict:
+    """
+    Build rich context for the AI tutor including user profile, errors, and skills.
+
+    This context helps the AI personalize feedback based on:
+    - User's level, goals, interests, native language
+    - Recent error patterns (to address recurring mistakes)
+    - Weak skills (to focus corrections)
+    """
+    # Base context
+    context = {
+        "source": "api",
+        "mode": "scenario" if scenario_id else "text",
+        "scenario_id": scenario_id,
+        "session_id": str(session_id) if session_id else None,
+        "user_id": str(user_id),
+        "turn_number": turn_number,
+        "raw_context": context_str,
+    }
+
+    # User profile data
+    context["level"] = user.get('level', 'A1')
+    context["native_language"] = user.get('native_language')
+    context["goals"] = user.get('goals', [])
+    context["interests"] = user.get('interests', [])
+
+    # Recent errors (last 10) - helps identify recurring patterns
+    try:
+        recent_errors = db.get_user_errors(user_id, limit=10)
+        if recent_errors:
+            # Summarize error patterns
+            error_summary = []
+            error_types = {}
+            for err in recent_errors:
+                err_type = err.get('error_type', 'unknown')
+                error_types[err_type] = error_types.get(err_type, 0) + 1
+                if len(error_summary) < 5:  # Keep top 5 examples
+                    error_summary.append({
+                        "type": err_type,
+                        "mistake": err.get('user_sentence', '')[:100],
+                        "correction": err.get('corrected_sentence', '')[:100],
+                    })
+            context["recent_error_patterns"] = error_types
+            context["recent_error_examples"] = error_summary
+    except Exception:
+        pass  # Don't fail if error history unavailable
+
+    # Weak skills (top 3) - focus corrections on problem areas
+    try:
+        weak_skills = db.get_weakest_skills(user_id, limit=3)
+        if weak_skills:
+            context["weak_skills"] = [
+                {"skill": s.get('skill_key'), "mastery": s.get('mastery_score', 0)}
+                for s in weak_skills
+            ]
+    except Exception:
+        pass  # Don't fail if skill data unavailable
+
+    return context
+
 
 @app.post("/api/tutor/text", tags=["Tutor"])
 async def tutor_text(
@@ -509,6 +482,7 @@ async def tutor_text(
 
         scenario_id = payload.get("scenario_id")
         context_str = payload.get("context")
+        turn_number = payload.get("turn_number", 1)
         session_id_raw = payload.get("session_id")
         session_id: Optional[uuid.UUID] = None
         if session_id_raw:
@@ -533,22 +507,22 @@ async def tutor_text(
         else:
             session = {"session_id": session_id}
 
-        # Get user level for tutor mode (beginner vs advanced)
-        user_level = user.get('level', 'A1')
+        # Build rich context with user profile, errors, and skills
+        rich_context = build_rich_tutor_context(
+            db=db,
+            user_id=user_id,
+            user=user,
+            scenario_id=scenario_id,
+            session_id=session_id,
+            context_str=context_str,
+            turn_number=turn_number,
+        )
 
-        # Run tutor
-        tutor = TutorAgent()
+        # Run tutor with enriched context and conversation memory
+        tutor = TutorAgent(user_id=str(user_id), db=db)
         tutor_response: TutorResponse = tutor.process_user_input(
             text,
-            context={
-                "source": "api",
-                "mode": "text",
-                "scenario_id": scenario_id,
-                "session_id": str(session_id),
-                "user_id": str(user_id),
-                "level": user_level,
-                "raw_context": context_str,
-            },
+            context=rich_context,
         )
 
         # Log errors + create SRS cards
@@ -564,6 +538,24 @@ async def tutor_text(
             )
             db.create_card_from_error(error_id=err_record["error_id"])
 
+        # Save conversation turn to memory
+        try:
+            db.save_conversation_turn(
+                user_id=user_id,
+                session_id=session_id,
+                turn_number=turn_number,
+                user_message=text,
+                tutor_response=tutor_response.message,
+                context_type=scenario_id or "free_chat",
+                context_id=scenario_id,
+                metadata={
+                    "error_count": len(tutor_response.errors),
+                    "has_micro_task": tutor_response.micro_task is not None
+                }
+            )
+        except Exception as e:
+            print(f"Warning: Failed to save conversation turn: {e}")
+
         # Build response
         return {
             "message": tutor_response.message,
@@ -576,53 +568,6 @@ async def tutor_text(
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Tutor text error: {e}")
-
-@app.post("/api/demo/grammar", tags=["Demo"])
-async def demo_grammar(payload: dict = Body(...)):
-    """
-    Public demo endpoint for grammar checking.
-
-    Does NOT require authentication. Used for landing page interactive demo.
-    Does NOT log errors or create SRS cards.
-
-    Returns grammar corrections for the provided text.
-    """
-    try:
-        # Extract text from payload
-        text = payload.get("text")
-        if not isinstance(text, str) or not text.strip():
-            raise HTTPException(status_code=400, detail="Invalid or missing text")
-
-        # Run tutor agent with beginner level (A1) for demo
-        tutor = TutorAgent()
-        tutor_response: TutorResponse = tutor.process_user_input(
-            text,
-            context={
-                "source": "demo",
-                "mode": "text",
-                "level": "A1",
-            },
-        )
-
-        # Return only the corrected text and explanation
-        # Format matches the demo's expected structure
-        if tutor_response.errors:
-            first_error = tutor_response.errors[0]
-            return {
-                "corrected": first_error.corrected_sentence,
-                "explanation": first_error.explanation,
-            }
-        else:
-            return {
-                "corrected": text,
-                "explanation": "Great! No errors found.",
-            }
-
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Demo grammar error: {e}")
-
 
 @app.post("/api/tutor/voice", tags=["Tutor"])
 async def tutor_voice(
@@ -694,6 +639,25 @@ async def tutor_voice(
                 source_type="voice_tutor",
             )
             db.create_card_from_error(error_id=err_record["error_id"])
+
+        # Save conversation turn to memory
+        try:
+            db.save_conversation_turn(
+                user_id=user_id,
+                session_id=session_id,
+                turn_number=1,  # Voice sessions are typically one turn at a time
+                user_message=result.recognized_text,
+                tutor_response=result.tutor_response.message,
+                context_type="voice_tutor",
+                context_id=None,
+                metadata={
+                    "error_count": len(result.tutor_response.errors),
+                    "has_audio": True,
+                    "filename": filename
+                }
+            )
+        except Exception as e:
+            print(f"Warning: Failed to save voice conversation turn: {e}")
 
         # Read TTS audio file and encode as base64
         import base64
@@ -1058,303 +1022,6 @@ async def get_weakest_skills(
         raise HTTPException(
             status_code=500,
             detail=f"Failed to get weakest skills: {str(e)}"
-        )
-
-
-# ============================================================================
-# Streaks Endpoints
-# ============================================================================
-
-@app.get("/api/streaks/current", tags=["Streaks"])
-async def get_current_streak(
-    db: Database = Depends(get_database),
-    user_id_from_token: str = Depends(verify_token),
-):
-    """
-    Get current user's streak information.
-
-    Requires JWT authentication. User ID is extracted from the token.
-
-    Returns:
-    - current_streak: Current consecutive days streak
-    - longest_streak: Longest streak ever achieved
-    - last_active_date: Date of last activity
-    """
-    try:
-        user_id = uuid.UUID(user_id_from_token)
-    except Exception:
-        raise HTTPException(status_code=400, detail="Invalid user_id from token")
-
-    try:
-        streak_data = db.get_user_streak(user_id)
-
-        if streak_data is None:
-            # Return zeros if no data found
-            return {
-                "current_streak": 0,
-                "longest_streak": 0,
-                "last_active_date": None
-            }
-
-        return streak_data
-
-    except Exception as e:
-        raise HTTPException(
-            status_code=500,
-            detail=f"Failed to get streak data: {str(e)}"
-        )
-
-
-@app.post("/api/streaks/record-activity", tags=["Streaks"])
-async def record_activity(
-    db: Database = Depends(get_database),
-    user_id_from_token: str = Depends(verify_token),
-):
-    """
-    Record user activity and update streak.
-
-    Call this when the user completes an exercise, lesson, or any meaningful activity.
-    The streak logic handles:
-    - First activity: creates streak record with 1 day
-    - Already logged today: returns current streak (no change)
-    - Continuing from yesterday: increments streak
-    - Streak broken (gap > 1 day): resets to 1
-
-    Returns:
-    - current_streak: Current consecutive days streak
-    - longest_streak: Longest streak ever achieved
-    - last_active_date: Date of last activity
-    - total_days_active: Total number of active days
-    - freeze_days_available: Freeze days remaining
-    """
-    try:
-        user_id = uuid.UUID(user_id_from_token)
-    except Exception:
-        raise HTTPException(status_code=400, detail="Invalid user_id from token")
-
-    try:
-        streak_data = db.record_activity(user_id)
-        return streak_data
-
-    except Exception as e:
-        raise HTTPException(
-            status_code=500,
-            detail=f"Failed to record activity: {str(e)}"
-        )
-
-
-# ============================================================================
-# Achievements Endpoints
-# ============================================================================
-
-@app.get("/api/achievements", tags=["Achievements"])
-async def get_all_achievements(
-    db: Database = Depends(get_database),
-    user_id_from_token: str = Depends(verify_token),
-):
-    """
-    Get all available achievements.
-
-    Returns list of all achievements with their details.
-    """
-    try:
-        achievements = db.get_achievements()
-        return {"achievements": achievements, "count": len(achievements)}
-    except Exception as e:
-        raise HTTPException(
-            status_code=500,
-            detail=f"Failed to get achievements: {str(e)}"
-        )
-
-
-@app.get("/api/achievements/mine", tags=["Achievements"])
-async def get_my_achievements(
-    db: Database = Depends(get_database),
-    user_id_from_token: str = Depends(verify_token),
-):
-    """
-    Get current user's unlocked achievements.
-
-    Returns list of achievements the user has unlocked.
-    """
-    try:
-        user_id = uuid.UUID(user_id_from_token)
-    except Exception:
-        raise HTTPException(status_code=400, detail="Invalid user_id from token")
-
-    try:
-        achievements = db.get_user_achievements(user_id)
-        return {"achievements": achievements, "count": len(achievements)}
-    except Exception as e:
-        raise HTTPException(
-            status_code=500,
-            detail=f"Failed to get user achievements: {str(e)}"
-        )
-
-
-# ============================================================================
-# Daily Goals Endpoints
-# ============================================================================
-
-@app.get("/api/goals/today", tags=["Goals"])
-async def get_today_goal(
-    db: Database = Depends(get_database),
-    user_id_from_token: str = Depends(verify_token),
-):
-    """
-    Get today's daily goal for the authenticated user.
-
-    Returns the daily goal with targets and actual progress.
-    """
-    try:
-        user_id = uuid.UUID(user_id_from_token)
-    except Exception:
-        raise HTTPException(status_code=400, detail="Invalid user_id from token")
-
-    try:
-        goal = db.get_daily_goal(user_id)
-
-        if not goal:
-            # Create default goal if doesn't exist
-            goal = db.create_or_update_daily_goal(
-                user_id,
-                target_study_minutes=30,
-                target_lessons=1,
-                target_reviews=10,
-                target_drills=2
-            )
-
-        return goal
-    except Exception as e:
-        raise HTTPException(
-            status_code=500,
-            detail=f"Failed to get daily goal: {str(e)}"
-        )
-
-
-@app.post("/api/goals/today", tags=["Goals"])
-async def update_today_goal(
-    payload: dict = Body(...),
-    db: Database = Depends(get_database),
-    user_id_from_token: str = Depends(verify_token),
-):
-    """
-    Update today's daily goal targets.
-
-    Payload can include: target_study_minutes, target_lessons, target_reviews, target_drills
-    """
-    try:
-        user_id = uuid.UUID(user_id_from_token)
-    except Exception:
-        raise HTTPException(status_code=400, detail="Invalid user_id from token")
-
-    try:
-        goal = db.create_or_update_daily_goal(
-            user_id,
-            target_study_minutes=payload.get("target_study_minutes"),
-            target_lessons=payload.get("target_lessons"),
-            target_reviews=payload.get("target_reviews"),
-            target_drills=payload.get("target_drills")
-        )
-
-        return goal
-    except Exception as e:
-        raise HTTPException(
-            status_code=500,
-            detail=f"Failed to update daily goal: {str(e)}"
-        )
-
-
-# ============================================================================
-# Referrals Endpoints
-# ============================================================================
-
-@app.get("/api/referrals/my-code", tags=["Referrals"])
-async def get_my_referral_code(
-    db: Database = Depends(get_database),
-    user_id_from_token: str = Depends(verify_token),
-):
-    """
-    Get the authenticated user's referral code.
-
-    Creates a code if the user doesn't have one yet.
-    """
-    try:
-        user_id = uuid.UUID(user_id_from_token)
-    except Exception:
-        raise HTTPException(status_code=400, detail="Invalid user_id from token")
-
-    try:
-        code_data = db.get_or_create_referral_code(user_id)
-        return code_data
-    except Exception as e:
-        raise HTTPException(
-            status_code=500,
-            detail=f"Failed to get referral code: {str(e)}"
-        )
-
-
-@app.get("/api/referrals/stats", tags=["Referrals"])
-async def get_referral_stats(
-    db: Database = Depends(get_database),
-    user_id_from_token: str = Depends(verify_token),
-):
-    """
-    Get the authenticated user's referral statistics.
-
-    Returns referral code, total signups, and conversions.
-    """
-    try:
-        user_id = uuid.UUID(user_id_from_token)
-    except Exception:
-        raise HTTPException(status_code=400, detail="Invalid user_id from token")
-
-    try:
-        stats = db.get_referral_stats(user_id)
-        return stats
-    except Exception as e:
-        raise HTTPException(
-            status_code=500,
-            detail=f"Failed to get referral stats: {str(e)}"
-        )
-
-
-@app.post("/api/referrals/claim", tags=["Referrals"])
-async def claim_referral(
-    payload: dict = Body(...),
-    db: Database = Depends(get_database),
-    user_id_from_token: str = Depends(verify_token),
-):
-    """
-    Claim a referral code for the current user.
-
-    Payload: { "referral_code": "ABC12345" }
-    """
-    try:
-        user_id = uuid.UUID(user_id_from_token)
-    except Exception:
-        raise HTTPException(status_code=400, detail="Invalid user_id from token")
-
-    referral_code = payload.get("referral_code")
-    if not referral_code:
-        raise HTTPException(status_code=400, detail="Missing referral_code")
-
-    try:
-        success = db.claim_referral_code(user_id, referral_code)
-
-        if not success:
-            raise HTTPException(
-                status_code=400,
-                detail="Invalid referral code or already claimed"
-            )
-
-        return {"status": "success", "message": "Referral code claimed successfully"}
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(
-            status_code=500,
-            detail=f"Failed to claim referral: {str(e)}"
         )
 
 
@@ -2125,7 +1792,7 @@ async def get_placement_test_questions():
 async def submit_placement_test(
     payload: dict,
     db: Database = Depends(get_database),
-    user_id_from_token: Optional[str] = Depends(optional_verify_token),
+    user_id_from_token: str = Depends(verify_token),
 ):
     """
     Submit placement test answers and get results.
@@ -2136,9 +1803,6 @@ async def submit_placement_test(
     }
 
     Returns level determination and feedback.
-
-    Auth is optional - if authenticated, saves level to user profile.
-    If not authenticated (during onboarding), just returns results.
     """
     from app.placement_test import placement_evaluator
 
@@ -2150,18 +1814,17 @@ async def submit_placement_test(
     # Evaluate the test
     result = placement_evaluator.evaluate_test(answers)
 
-    # Update user's level in database if authenticated
-    if user_id_from_token:
-        try:
-            user_id = uuid.UUID(user_id_from_token)
-            # Update user profile with determined level
-            db.update_user_profile(
-                user_id=user_id,
-                level=result.level
-            )
-        except Exception as e:
-            # Don't fail the request if DB update fails
-            print(f"Warning: Failed to update user profile: {e}")
+    # Update user's level in database
+    try:
+        user_id = uuid.UUID(user_id_from_token)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid user_id from token")
+
+    # Update user profile with determined level
+    db.update_user_profile(
+        user_id=user_id,
+        level=result.level
+    )
 
     return {
         "level": result.level,
@@ -2174,25 +1837,205 @@ async def submit_placement_test(
 
 
 # ============================================================================
-# Learning Dashboard Endpoint
+# Exercise Endpoints
 # ============================================================================
 
-@app.get("/api/learning/dashboard", tags=["Learning"])
-async def get_learning_dashboard(
+@app.get("/api/exercises/session", tags=["Exercises"])
+async def get_exercise_session(
+    count: int = 5,
+    level: Optional[str] = None,
+    skill: Optional[str] = None,
+    exercise_type: Optional[str] = None,
+    user_id_from_token: str = Depends(verify_token),
+):
+    """
+    Get a practice session with exercises.
+
+    Args:
+        count: Number of exercises (default 5)
+        level: Filter by level (A1, A2, B1, B2, C1, C2)
+        skill: Filter by skill type (grammar, vocabulary)
+        exercise_type: Filter by type (multiple_choice, fill_blank, sentence_correction)
+
+    Returns:
+        List of exercises for the session
+    """
+    from app.exercises import exercise_manager, SkillType, ExerciseType
+
+    # Convert string params to enums
+    skill_enum = None
+    if skill:
+        try:
+            skill_enum = SkillType(skill.lower())
+        except ValueError:
+            pass
+
+    type_enum = None
+    if exercise_type:
+        try:
+            type_enum = ExerciseType(exercise_type.lower())
+        except ValueError:
+            pass
+
+    # Get user level if not specified
+    if not level:
+        try:
+            user_id = uuid.UUID(user_id_from_token)
+            user = get_or_create_user(str(user_id))
+            level = user.get('level', 'B1')
+        except:
+            level = 'B1'
+
+    exercises = exercise_manager.get_practice_session(
+        count=count,
+        level=level,
+        skill=skill_enum,
+        exercise_type=type_enum,
+    )
+
+    return {
+        "exercises": [
+            {
+                "id": ex.exercise_id,
+                "type": ex.exercise_type.value,
+                "level": ex.level,
+                "skill": ex.skill.value,
+                "question": ex.question,
+                "options": ex.options,
+                "hint": ex.hint,
+                # Don't send correct answer to client
+            }
+            for ex in exercises
+        ],
+        "count": len(exercises),
+    }
+
+
+@app.post("/api/exercises/submit", tags=["Exercises"])
+async def submit_exercise_answer(
+    payload: dict = Body(...),
     db: Database = Depends(get_database),
     user_id_from_token: str = Depends(verify_token),
 ):
     """
-    Get adaptive learning dashboard with personalized recommendations.
+    Submit an answer for an exercise.
+
+    Payload:
+    {
+        "exercise_id": "mc-gram-b1-001",
+        "user_answer": "were"
+    }
 
     Returns:
-    - todayFocus: 3 prioritized tasks based on weak skills
-    - skillScores: grammar/vocabulary/fluency/pronunciation scores (0-100)
-    - progressPath: Current CEFR level, progress %, and ETA to next level
-    - recentGrowth: 7-day activity heatmap
-    - minutesStudiedToday: Today's study time
-    - currentStreak: Current streak count
-    - dailyGoal: Daily time goal in minutes
+        is_correct, correct_answer, explanation, xp_earned
+    """
+    from app.exercises import exercise_manager
+
+    exercise_id = payload.get("exercise_id")
+    user_answer = payload.get("user_answer")
+
+    if not exercise_id:
+        raise HTTPException(status_code=400, detail="Missing exercise_id")
+    if not user_answer and user_answer != 0:  # Allow 0 as answer
+        raise HTTPException(status_code=400, detail="Missing user_answer")
+
+    try:
+        user_id = uuid.UUID(user_id_from_token)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid user_id from token")
+
+    try:
+        result = exercise_manager.check_answer(exercise_id, str(user_answer))
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+
+    # Calculate XP
+    xp_earned = 10 if result["is_correct"] else 0
+
+    # Log the exercise attempt
+    try:
+        session = db.create_session(
+            user_id=user_id,
+            session_type="exercise",
+            metadata={
+                "exercise_id": exercise_id,
+                "user_answer": str(user_answer),
+                "is_correct": result["is_correct"],
+            }
+        )
+
+        # If incorrect, log as error for SRS
+        if not result["is_correct"]:
+            exercise = exercise_manager.get_exercise(exercise_id)
+            if exercise:
+                err_record = db.log_error(
+                    user_id=user_id,
+                    error_type=exercise.skill.value,
+                    user_sentence=str(user_answer),
+                    corrected_sentence=result["correct_answer"],
+                    explanation=result["explanation"],
+                    session_id=session["session_id"],
+                    source_type="exercise",
+                )
+                db.create_card_from_error(error_id=err_record["error_id"])
+    except Exception as e:
+        # Log but don't fail the request
+        print(f"Warning: Failed to log exercise: {e}")
+
+    return {
+        "is_correct": result["is_correct"],
+        "correct_answer": result["correct_answer"],
+        "explanation": result["explanation"],
+        "xp_earned": xp_earned,
+    }
+
+
+@app.get("/api/exercises/{exercise_id}", tags=["Exercises"])
+async def get_exercise(
+    exercise_id: str,
+    user_id_from_token: str = Depends(verify_token),
+):
+    """
+    Get a specific exercise by ID.
+
+    Returns the exercise without the correct answer.
+    """
+    from app.exercises import exercise_manager
+
+    exercise = exercise_manager.get_exercise(exercise_id)
+
+    if not exercise:
+        raise HTTPException(status_code=404, detail=f"Exercise '{exercise_id}' not found")
+
+    return {
+        "id": exercise.exercise_id,
+        "type": exercise.exercise_type.value,
+        "level": exercise.level,
+        "skill": exercise.skill.value,
+        "question": exercise.question,
+        "options": exercise.options,
+        "hint": exercise.hint,
+    }
+
+
+# ============================================================================
+# Streaks Endpoints
+# ============================================================================
+
+@app.get("/api/streaks/current", tags=["Streaks"])
+async def get_current_streak(
+    db: Database = Depends(get_database),
+    user_id_from_token: str = Depends(verify_token),
+):
+    """
+    Get current user's streak information.
+
+    Requires JWT authentication. User ID is extracted from the token.
+
+    Returns:
+    - current_streak: Current consecutive days streak
+    - longest_streak: Longest streak ever achieved
+    - last_active_date: Date of last activity
     """
     try:
         user_id = uuid.UUID(user_id_from_token)
@@ -2200,413 +2043,241 @@ async def get_learning_dashboard(
         raise HTTPException(status_code=400, detail="Invalid user_id from token")
 
     try:
-        # Get user profile
-        profile = db.get_user_profile(user_id)
-        if not profile:
-            raise HTTPException(status_code=404, detail="User profile not found")
-
-        # Get skill weaknesses
-        weak_skills_data = db.get_weakest_skills(user_id, limit=3)
-        weak_skills = [skill["skill_category"] for skill in weak_skills_data]
-
-        # Calculate skill scores (0-100) based on mastery
-        skill_scores = {
-            "grammar": 75,
-            "vocabulary": 68,
-            "fluency": 82,
-            "pronunciation": 71,
-        }
-
-        # Adjust scores based on actual weak skills data
-        for skill_data in weak_skills_data:
-            skill_cat = skill_data["skill_category"].lower()
-            if skill_cat in skill_scores:
-                # Lower score for weaker skills
-                skill_scores[skill_cat] = int(skill_data["mastery_score"])
-
-        # Generate 3 prioritized tasks based on weak skills
-        today_focus = []
-        task_templates = {
-            "grammar": {
-                "type": "lesson",
-                "title": "Grammar Practice: Present Perfect",
-                "duration": 10,
-                "skill": "Grammar",
-                "href": "/lessons"
-            },
-            "vocabulary": {
-                "type": "drill",
-                "title": "Vocabulary Building: Common Phrases",
-                "duration": 8,
-                "skill": "Vocabulary",
-                "href": "/drills"
-            },
-            "fluency": {
-                "type": "scenario",
-                "title": "Conversation: At a Restaurant",
-                "duration": 15,
-                "skill": "Fluency",
-                "href": "/scenarios"
-            },
-            "pronunciation": {
-                "type": "drill",
-                "title": "Pronunciation: Difficult Sounds",
-                "duration": 12,
-                "skill": "Pronunciation",
-                "href": "/pronunciation"
-            }
-        }
-
-        # Prioritize tasks based on weakest skills
-        task_counter = 0
-        for weak_skill in weak_skills:
-            skill_key = weak_skill.lower()
-            if skill_key in task_templates and task_counter < 3:
-                task = task_templates[skill_key].copy()
-                task["id"] = f"task-{task_counter + 1}"
-                today_focus.append(task)
-                task_counter += 1
-
-        # Fill remaining slots with varied tasks
-        if len(today_focus) < 3:
-            default_tasks = [
-                {
-                    "id": "task-default-1",
-                    "type": "scenario",
-                    "title": "Daily Conversation Practice",
-                    "duration": 10,
-                    "skill": "Speaking",
-                    "href": "/scenarios"
-                },
-                {
-                    "id": "task-default-2",
-                    "type": "lesson",
-                    "title": "Review Lesson: Basic Tenses",
-                    "duration": 8,
-                    "skill": "Grammar",
-                    "href": "/lessons"
-                },
-            ]
-            for task in default_tasks:
-                if len(today_focus) < 3:
-                    today_focus.append(task)
-
-        # Calculate CEFR progress
-        cefr_levels = ["A1", "A2", "B1", "B2", "C1", "C2"]
-        current_level = profile["level"]
-        current_index = cefr_levels.index(current_level) if current_level in cefr_levels else 0
-        next_level = cefr_levels[current_index + 1] if current_index < len(cefr_levels) - 1 else current_level
-
-        # Estimate progress (simplified - would use actual activity data)
-        progress = 45  # 45% progress to next level
-        days_to_next = 30  # Estimated days to next level
-
-        # Get streak data
         streak_data = db.get_user_streak(user_id)
-        current_streak = streak_data.get("current_streak", 0) if streak_data else 0
 
-        # Get recent activity (last 7 days)
-        from datetime import timedelta
-        today = datetime.now().date()
-        recent_growth = []
+        if streak_data is None:
+            return {
+                "current_streak": 0,
+                "longest_streak": 0,
+                "last_active_date": None
+            }
 
-        for i in range(7):
-            date = today - timedelta(days=6-i)
-            # Simplified - would fetch actual session data
-            minutes = 0
-            if i >= 3:  # Some activity in last 4 days
-                minutes = 15 if i % 2 == 0 else 20
-
-            recent_growth.append({
-                "date": date.isoformat(),
-                "minutes": minutes
-            })
-
-        # Get today's goal
-        daily_goal_data = db.get_daily_goal(user_id)
-        daily_goal = profile.get("daily_time_goal", 30)
-        minutes_today = 0  # Would fetch from actual session tracking
-
-        if daily_goal_data:
-            daily_goal = daily_goal_data.get("target_study_minutes", 30)
-            minutes_today = daily_goal_data.get("actual_study_minutes", 0)
-
-        return {
-            "todayFocus": today_focus,
-            "skillScores": skill_scores,
-            "progressPath": {
-                "current": current_level,
-                "next": next_level,
-                "progress": progress,
-                "daysToNext": days_to_next
-            },
-            "recentGrowth": recent_growth,
-            "minutesStudiedToday": minutes_today,
-            "currentStreak": current_streak,
-            "dailyGoal": daily_goal
-        }
+        return streak_data
 
     except Exception as e:
         raise HTTPException(
             status_code=500,
-            detail=f"Failed to load learning dashboard: {str(e)}"
+            detail=f"Failed to get streak data: {str(e)}"
+        )
+
+
+@app.post("/api/streaks/record-activity", tags=["Streaks"])
+async def record_activity(
+    db: Database = Depends(get_database),
+    user_id_from_token: str = Depends(verify_token),
+):
+    """
+    Record user activity and update streak.
+
+    Call this when the user completes an exercise, lesson, or any meaningful activity.
+    The streak logic handles:
+    - First activity: creates streak record with 1 day
+    - Already logged today: returns current streak (no change)
+    - Continuing from yesterday: increments streak
+    - Streak broken (gap > 1 day): resets to 1
+
+    Returns:
+    - current_streak: Current consecutive days streak
+    - longest_streak: Longest streak ever achieved
+    - last_active_date: Date of last activity
+    - total_days_active: Total number of active days
+    - freeze_days_available: Freeze days remaining
+    """
+    try:
+        user_id = uuid.UUID(user_id_from_token)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid user_id from token")
+
+    try:
+        streak_data = db.record_activity(user_id)
+        return streak_data
+
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to record activity: {str(e)}"
         )
 
 
 # ============================================================================
-# Content Library Endpoints (Database-backed)
+# Daily Goals Endpoints
 # ============================================================================
 
-@app.get("/api/content", tags=["Content"])
-async def get_all_content(
-    content_type: Optional[str] = None,
-    level: Optional[str] = None,
+@app.get("/api/goals/today", tags=["Goals"])
+async def get_today_goal(
+    db: Database = Depends(get_database),
+    user_id_from_token: str = Depends(verify_token),
+):
+    """
+    Get today's daily goal for the authenticated user.
+
+    Creates a goal with default targets if it doesn't exist.
+
+    Returns:
+    - goal_id: Goal UUID
+    - user_id: User UUID
+    - goal_date: Date of the goal
+    - target_study_minutes: Target study time in minutes
+    - target_lessons: Target number of lessons
+    - target_reviews: Target number of reviews
+    - target_drills: Target number of drills
+    - actual_study_minutes: Actual study time completed
+    - actual_lessons: Actual lessons completed
+    - actual_reviews: Actual reviews completed
+    - actual_drills: Actual drills completed
+    - completed: Whether all goals are completed
+    - completion_percentage: Overall completion percentage (0-100)
+    """
+    try:
+        user_id = uuid.UUID(user_id_from_token)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid user_id from token")
+
+    try:
+        # Try to get existing goal
+        goal = db.get_daily_goal(user_id)
+
+        # If no goal exists, create one with default targets
+        if not goal:
+            goal = db.create_or_update_daily_goal(
+                user_id=user_id,
+                target_study_minutes=30,
+                target_lessons=1,
+                target_reviews=10,
+                target_drills=2
+            )
+
+        return goal
+
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to get daily goal: {str(e)}"
+        )
+
+
+@app.post("/api/goals/today", tags=["Goals"])
+async def update_today_goal(
+    targets: dict = Body(...),
+    db: Database = Depends(get_database),
+    user_id_from_token: str = Depends(verify_token),
+):
+    """
+    Update today's goal targets for the authenticated user.
+
+    Request body:
+    {
+        "target_study_minutes": 45,
+        "target_lessons": 2,
+        "target_reviews": 15,
+        "target_drills": 3
+    }
+
+    All fields are optional - only provided fields will be updated.
+
+    Returns the updated daily goal.
+    """
+    try:
+        user_id = uuid.UUID(user_id_from_token)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid user_id from token")
+
+    try:
+        # Extract targets from request
+        target_study_minutes = targets.get("target_study_minutes")
+        target_lessons = targets.get("target_lessons")
+        target_reviews = targets.get("target_reviews")
+        target_drills = targets.get("target_drills")
+
+        # Update or create goal with new targets
+        goal = db.create_or_update_daily_goal(
+            user_id=user_id,
+            target_study_minutes=target_study_minutes,
+            target_lessons=target_lessons,
+            target_reviews=target_reviews,
+            target_drills=target_drills
+        )
+
+        return goal
+
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to update daily goal: {str(e)}"
+        )
+
+
+@app.post("/api/goals/today/progress", tags=["Goals"])
+async def update_goal_progress(
+    progress: dict = Body(...),
+    db: Database = Depends(get_database),
+    user_id_from_token: str = Depends(verify_token),
+):
+    """
+    Increment today's goal progress for the authenticated user.
+
+    Request body:
+    {
+        "study_minutes": 15,
+        "lessons": 1,
+        "reviews": 5,
+        "drills": 1
+    }
+
+    All fields are optional and default to 0.
+    This endpoint increments the current progress values.
+
+    Returns the updated daily goal with new progress.
+    """
+    try:
+        user_id = uuid.UUID(user_id_from_token)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid user_id from token")
+
+    try:
+        # Extract progress increments from request
+        study_minutes = progress.get("study_minutes", 0)
+        lessons = progress.get("lessons", 0)
+        reviews = progress.get("reviews", 0)
+        drills = progress.get("drills", 0)
+
+        # Increment progress
+        goal = db.increment_daily_goal_progress(
+            user_id=user_id,
+            study_minutes=study_minutes,
+            lessons=lessons,
+            reviews=reviews,
+            drills=drills
+        )
+
+        return goal
+
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to update goal progress: {str(e)}"
+        )
+
+
+# ============================================================================
+# Leaderboard Endpoints
+# ============================================================================
+
+@app.get("/api/leaderboard/weekly", tags=["Leaderboard"])
+async def get_weekly_leaderboard(
     limit: int = 50,
     db: Database = Depends(get_database),
     user_id_from_token: str = Depends(verify_token),
 ):
     """
-    Get content from the content library.
+    Get weekly leaderboard (top users by XP gained this week).
 
-    Query params:
-    - content_type: Filter by type (lesson, scenario, monologue, journal, pronunciation_phrase)
-    - level: Filter by CEFR level (A1, A2, B1, B2, C1, C2)
-    - limit: Max results (default 50)
+    Returns top 50 users plus authenticated user's rank if not in top 50.
+    XP is calculated based on completed sessions (10 XP per session).
 
-    Returns content items from the database.
-    """
-    try:
-        with db.get_connection() as conn:
-            with conn.cursor() as cursor:
-                # Build query
-                query = """
-                    SELECT
-                        content_id, content_type, title,
-                        level_min, level_max, skill_targets,
-                        content_data, metadata, created_at
-                    FROM content_library
-                    WHERE 1=1
-                """
-                params = []
-
-                if content_type:
-                    query += " AND content_type = %s"
-                    params.append(content_type)
-
-                if level:
-                    query += " AND (level_min <= %s AND level_max >= %s)"
-                    params.extend([level, level])
-
-                query += " ORDER BY created_at DESC LIMIT %s"
-                params.append(limit)
-
-                cursor.execute(query, params)
-                rows = cursor.fetchall()
-
-                content_items = [
-                    {
-                        "content_id": str(row['content_id']),
-                        "content_type": row['content_type'],
-                        "title": row['title'],
-                        "level_min": row['level_min'],
-                        "level_max": row['level_max'],
-                        "skill_targets": row['skill_targets'],
-                        "content_data": row['content_data'],
-                        "metadata": row['metadata'],
-                        "created_at": row['created_at'].isoformat() if row['created_at'] else None,
-                    }
-                    for row in rows
-                ]
-
-                return {
-                    "content": content_items,
-                    "count": len(content_items),
-                    "filters": {
-                        "content_type": content_type,
-                        "level": level
-                    }
-                }
-
-    except Exception as e:
-        raise HTTPException(
-            status_code=500,
-            detail=f"Failed to get content: {str(e)}"
-        )
-
-
-@app.get("/api/content/{content_id}", tags=["Content"])
-async def get_content_by_id(
-    content_id: uuid.UUID,
-    db: Database = Depends(get_database),
-    user_id_from_token: str = Depends(verify_token),
-):
-    """
-    Get a specific content item by ID.
-    """
-    try:
-        with db.get_connection() as conn:
-            with conn.cursor() as cursor:
-                cursor.execute("""
-                    SELECT
-                        content_id, content_type, title,
-                        level_min, level_max, skill_targets,
-                        content_data, audio_url, metadata, created_at
-                    FROM content_library
-                    WHERE content_id = %s
-                """, (str(content_id),))
-
-                row = cursor.fetchone()
-
-                if not row:
-                    raise HTTPException(status_code=404, detail="Content not found")
-
-                return {
-                    "content_id": str(row['content_id']),
-                    "content_type": row['content_type'],
-                    "title": row['title'],
-                    "level_min": row['level_min'],
-                    "level_max": row['level_max'],
-                    "skill_targets": row['skill_targets'],
-                    "content_data": row['content_data'],
-                    "audio_url": row['audio_url'],
-                    "metadata": row['metadata'],
-                    "created_at": row['created_at'].isoformat() if row['created_at'] else None,
-                }
-
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(
-            status_code=500,
-            detail=f"Failed to get content: {str(e)}"
-        )
-
-
-@app.get("/api/content/type/{content_type}", tags=["Content"])
-async def get_content_by_type(
-    content_type: str,
-    level: Optional[str] = None,
-    db: Database = Depends(get_database),
-    user_id_from_token: str = Depends(verify_token),
-):
-    """
-    Get all content of a specific type.
-
-    Valid types: lesson, scenario, monologue, journal, pronunciation_phrase
-    """
-    valid_types = ["lesson", "scenario", "monologue", "journal", "pronunciation_phrase"]
-    if content_type not in valid_types:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Invalid content_type. Must be one of: {valid_types}"
-        )
-
-    try:
-        with db.get_connection() as conn:
-            with conn.cursor() as cursor:
-                query = """
-                    SELECT
-                        content_id, content_type, title,
-                        level_min, level_max, skill_targets,
-                        content_data, metadata, created_at
-                    FROM content_library
-                    WHERE content_type = %s
-                """
-                params = [content_type]
-
-                if level:
-                    query += " AND (level_min <= %s AND level_max >= %s)"
-                    params.extend([level, level])
-
-                query += " ORDER BY title ASC"
-
-                cursor.execute(query, params)
-                rows = cursor.fetchall()
-
-                content_items = [
-                    {
-                        "content_id": str(row['content_id']),
-                        "content_type": row['content_type'],
-                        "title": row['title'],
-                        "level_min": row['level_min'],
-                        "level_max": row['level_max'],
-                        "skill_targets": row['skill_targets'],
-                        "content_data": row['content_data'],
-                        "metadata": row['metadata'],
-                    }
-                    for row in rows
-                ]
-
-                return {
-                    "content": content_items,
-                    "count": len(content_items),
-                    "content_type": content_type
-                }
-
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(
-            status_code=500,
-            detail=f"Failed to get content: {str(e)}"
-        )
-
-
-@app.get("/api/content/summary", tags=["Content"])
-async def get_content_summary(
-    db: Database = Depends(get_database),
-):
-    """
-    Get a summary of available content (public endpoint).
-
-    Returns counts by content type and level.
-    """
-    try:
-        with db.get_connection() as conn:
-            with conn.cursor() as cursor:
-                # Count by type
-                cursor.execute("""
-                    SELECT content_type, COUNT(*) as count
-                    FROM content_library
-                    GROUP BY content_type
-                    ORDER BY content_type
-                """)
-                type_counts = {row['content_type']: row['count'] for row in cursor.fetchall()}
-
-                # Count by level
-                cursor.execute("""
-                    SELECT level_min, COUNT(*) as count
-                    FROM content_library
-                    GROUP BY level_min
-                    ORDER BY level_min
-                """)
-                level_counts = {row['level_min']: row['count'] for row in cursor.fetchall()}
-
-                # Total count
-                cursor.execute("SELECT COUNT(*) as total FROM content_library")
-                total = cursor.fetchone()['total']
-
-                return {
-                    "total_content": total,
-                    "by_type": type_counts,
-                    "by_level": level_counts
-                }
-
-    except Exception as e:
-        raise HTTPException(
-            status_code=500,
-            detail=f"Failed to get content summary: {str(e)}"
-        )
-
-
-# Temporary admin endpoint for testing
-@app.post("/api/admin/complete-onboarding", tags=["Admin"])
-async def complete_onboarding(
-    db: Database = Depends(get_database),
-    user_id_from_token: str = Depends(verify_token),
-):
-    """
-    Temporary endpoint to mark onboarding as complete for testing dashboard.
+    Returns:
+        - leaderboard: Array of top users with rank, name, xp, level
+        - current_user: Current user's rank and stats (if authenticated)
     """
     try:
         user_id = uuid.UUID(user_id_from_token)
@@ -2614,21 +2285,206 @@ async def complete_onboarding(
         raise HTTPException(status_code=400, detail="Invalid user_id from token")
 
     try:
-        query = """
-            UPDATE user_profile
-            SET onboarding_completed = true
-            WHERE user_id = $1
-            RETURNING onboarding_completed
-        """
-        result = await db.pool.fetchrow(query, user_id)
+        result = db.get_weekly_leaderboard(limit=limit, current_user_id=user_id)
+        return result
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to get weekly leaderboard: {str(e)}"
+        )
 
-        if not result:
-            raise HTTPException(status_code=404, detail="User profile not found")
+
+@app.get("/api/leaderboard/monthly", tags=["Leaderboard"])
+async def get_monthly_leaderboard(
+    limit: int = 50,
+    db: Database = Depends(get_database),
+    user_id_from_token: str = Depends(verify_token),
+):
+    """
+    Get monthly leaderboard (top users by XP gained this month).
+
+    Returns top 50 users plus authenticated user's rank if not in top 50.
+    XP is calculated based on completed sessions (10 XP per session).
+
+    Returns:
+        - leaderboard: Array of top users with rank, name, xp, level
+        - current_user: Current user's rank and stats (if authenticated)
+    """
+    try:
+        user_id = uuid.UUID(user_id_from_token)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid user_id from token")
+
+    try:
+        result = db.get_monthly_leaderboard(limit=limit, current_user_id=user_id)
+        return result
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to get monthly leaderboard: {str(e)}"
+        )
+
+
+@app.get("/api/leaderboard/alltime", tags=["Leaderboard"])
+async def get_alltime_leaderboard(
+    limit: int = 50,
+    db: Database = Depends(get_database),
+    user_id_from_token: str = Depends(verify_token),
+):
+    """
+    Get all-time leaderboard (top users by total XP).
+
+    Returns top 50 users plus authenticated user's rank if not in top 50.
+    XP is calculated based on all completed sessions (10 XP per session).
+
+    Returns:
+        - leaderboard: Array of top users with rank, name, total_xp, level
+        - current_user: Current user's rank and stats (if authenticated)
+    """
+    try:
+        user_id = uuid.UUID(user_id_from_token)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid user_id from token")
+
+    try:
+        result = db.get_alltime_leaderboard(limit=limit, current_user_id=user_id)
+        return result
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to get all-time leaderboard: {str(e)}"
+        )
+
+
+@app.get("/api/leaderboard/streaks", tags=["Leaderboard"])
+async def get_streak_leaderboard(
+    limit: int = 50,
+    db: Database = Depends(get_database),
+    user_id_from_token: str = Depends(verify_token),
+):
+    """
+    Get streak leaderboard (top users by current streak days).
+
+    Returns top 50 users plus authenticated user's rank if not in top 50.
+
+    Returns:
+        - leaderboard: Array of top users with rank, name, current_streak, level
+        - current_user: Current user's rank and stats (if authenticated)
+    """
+    try:
+        user_id = uuid.UUID(user_id_from_token)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid user_id from token")
+
+    try:
+        result = db.get_streak_leaderboard(limit=limit, current_user_id=user_id)
+        return result
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to get streak leaderboard: {str(e)}"
+        )
+
+
+# ============================================================================
+# Notifications Endpoints
+# ============================================================================
+
+@app.get("/api/notifications", tags=["Notifications"])
+async def get_notifications(
+    limit: int = 20,
+    offset: int = 0,
+    unread_only: bool = False,
+    db: Database = Depends(get_database),
+    user_id_from_token: str = Depends(verify_token),
+):
+    """
+    Get user's notifications (paginated, unread first).
+
+    Query params:
+    - limit: Maximum number of notifications to return (default 20)
+    - offset: Number of notifications to skip (default 0)
+    - unread_only: If true, only return unread notifications (default false)
+
+    Returns:
+    - notifications: List of notification objects
+    - count: Total number of notifications returned
+    - has_more: Whether there are more notifications to load
+    """
+    try:
+        user_id = uuid.UUID(user_id_from_token)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid user_id from token")
+
+    try:
+        notifications = db.get_notifications(
+            user_id=user_id,
+            limit=limit + 1,  # Get one extra to check if there are more
+            offset=offset,
+            unread_only=unread_only
+        )
+
+        has_more = len(notifications) > limit
+        if has_more:
+            notifications = notifications[:limit]
+
+        # Convert datetime objects to ISO strings for JSON serialization
+        for notif in notifications:
+            if notif.get('created_at'):
+                notif['created_at'] = notif['created_at'].isoformat()
+            if notif.get('read_at'):
+                notif['read_at'] = notif['read_at'].isoformat()
 
         return {
-            "success": True,
-            "message": f"Onboarding marked complete for user {user_id}",
-            "onboarding_completed": result["onboarding_completed"]
+            "notifications": notifications,
+            "count": len(notifications),
+            "has_more": has_more
+        }
+
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to get notifications: {str(e)}"
+        )
+
+
+@app.post("/api/notifications/{notification_id}/read", tags=["Notifications"])
+async def mark_notification_read(
+    notification_id: uuid.UUID,
+    db: Database = Depends(get_database),
+    user_id_from_token: str = Depends(verify_token),
+):
+    """
+    Mark a notification as read.
+
+    Args:
+        notification_id: UUID of the notification to mark as read
+
+    Returns:
+        Success confirmation
+    """
+    try:
+        user_id = uuid.UUID(user_id_from_token)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid user_id from token")
+
+    try:
+        # Verify the notification belongs to this user
+        notifications = db.get_notifications(user_id=user_id, limit=1000)
+        notification_ids = [n['notification_id'] for n in notifications]
+
+        if notification_id not in notification_ids:
+            raise HTTPException(status_code=404, detail="Notification not found")
+
+        success = db.mark_notification_read(notification_id)
+
+        if not success:
+            raise HTTPException(status_code=404, detail="Notification not found or already read")
+
+        return {
+            "status": "success",
+            "message": "Notification marked as read",
+            "notification_id": str(notification_id)
         }
 
     except HTTPException:
@@ -2636,143 +2492,243 @@ async def complete_onboarding(
     except Exception as e:
         raise HTTPException(
             status_code=500,
-            detail=f"Failed to update onboarding status: {str(e)}"
+            detail=f"Failed to mark notification as read: {str(e)}"
         )
 
 
-# ========================================
-# Payment Endpoints (Stripe Integration)
-# ========================================
-
-@app.post("/api/payments/create-checkout-session", response_model=CheckoutSessionResponse, tags=["Payments"])
-async def create_checkout_session(
-    request: CreateCheckoutSessionRequest,
+@app.post("/api/notifications/read-all", tags=["Notifications"])
+async def mark_all_notifications_read(
     db: Database = Depends(get_database),
     user_id_from_token: str = Depends(verify_token),
 ):
     """
-    Create a Stripe checkout session for subscription purchase.
+    Mark all notifications as read for the authenticated user.
 
-    Requires authentication. Returns a checkout URL to redirect the user to Stripe.
+    Returns:
+        Number of notifications marked as read
     """
     try:
         user_id = uuid.UUID(user_id_from_token)
     except Exception:
         raise HTTPException(status_code=400, detail="Invalid user_id from token")
 
-    payment_service = StripePaymentService(db)
-    result = await payment_service.create_checkout_session(
-        user_id=user_id,
-        price_id=request.price_id,
-        success_url=request.success_url,
-        cancel_url=request.cancel_url,
-    )
-
-    return CheckoutSessionResponse(**result)
-
-
-@app.post("/api/payments/webhook", tags=["Payments"])
-async def stripe_webhook(
-    request: Request,
-    db: Database = Depends(get_database),
-):
-    """
-    Handle Stripe webhook events.
-
-    This endpoint receives webhook events from Stripe for subscription lifecycle events.
-    No authentication required (verified via Stripe signature).
-    """
-    payload = await request.body()
-    sig_header = request.headers.get("stripe-signature")
-
-    webhook_secret = os.getenv("STRIPE_WEBHOOK_SECRET")
-
-    if not webhook_secret:
-        raise HTTPException(status_code=500, detail="Webhook secret not configured")
-
     try:
-        # Verify webhook signature
-        event = stripe.Webhook.construct_event(
-            payload, sig_header, webhook_secret
+        count = db.mark_all_notifications_read(user_id)
+
+        return {
+            "status": "success",
+            "message": f"Marked {count} notification(s) as read",
+            "count": count
+        }
+
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to mark all notifications as read: {str(e)}"
         )
-    except ValueError as e:
-        # Invalid payload
-        raise HTTPException(status_code=400, detail=f"Invalid payload: {str(e)}")
-    except stripe.error.SignatureVerificationError as e:
-        # Invalid signature
-        raise HTTPException(status_code=400, detail=f"Invalid signature: {str(e)}")
-
-    # Handle the event
-    payment_service = StripePaymentService(db)
-    result = await payment_service.handle_webhook_event(event)
-
-    return result
 
 
-@app.get("/api/payments/subscription", response_model=SubscriptionStatusResponse, tags=["Payments"])
-async def get_subscription_status(
+@app.get("/api/notifications/unread-count", tags=["Notifications"])
+async def get_unread_notification_count(
     db: Database = Depends(get_database),
     user_id_from_token: str = Depends(verify_token),
 ):
     """
-    Get the current user's subscription status.
+    Get unread notification count for badge display.
 
-    Returns subscription details including tier, status, billing info, and dates.
+    Returns:
+        Unread notification count
     """
     try:
         user_id = uuid.UUID(user_id_from_token)
     except Exception:
         raise HTTPException(status_code=400, detail="Invalid user_id from token")
 
-    payment_service = StripePaymentService(db)
-    result = await payment_service.get_subscription_status(user_id)
+    try:
+        count = db.get_unread_notification_count(user_id)
 
-    return SubscriptionStatusResponse(**result)
+        return {
+            "unread_count": count
+        }
+
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to get unread count: {str(e)}"
+        )
 
 
-@app.post("/api/payments/cancel", tags=["Payments"])
-async def cancel_subscription(
-    request: CancelSubscriptionRequest,
+# ============================================================================
+# Conversation History Endpoints
+# ============================================================================
+
+@app.get("/api/tutor/history", tags=["Tutor"])
+async def get_conversation_history(
+    limit: int = 20,
+    context_type: Optional[str] = None,
+    context_id: Optional[str] = None,
     db: Database = Depends(get_database),
     user_id_from_token: str = Depends(verify_token),
 ):
     """
-    Cancel the current user's subscription.
+    Get conversation history for the authenticated user.
 
-    The subscription will remain active until the end of the current billing period.
+    Query params:
+    - limit: Maximum number of conversation turns to return (default 20)
+    - context_type: Filter by context type (scenario, lesson, free_chat, etc.)
+    - context_id: Filter by specific context ID (scenario_id, lesson_id, etc.)
+
+    Returns:
+    - conversations: List of conversation turns with user messages and tutor responses
+    - count: Total number of conversations returned
+    - summary: High-level summary of conversation patterns
     """
     try:
         user_id = uuid.UUID(user_id_from_token)
     except Exception:
         raise HTTPException(status_code=400, detail="Invalid user_id from token")
 
-    payment_service = StripePaymentService(db)
-    result = await payment_service.cancel_subscription(user_id, request.reason)
+    try:
+        # Get filtered conversations if context specified
+        if context_type:
+            conversations = db.get_conversation_by_context(
+                user_id=user_id,
+                context_type=context_type,
+                context_id=context_id,
+                limit=limit
+            )
+        else:
+            # Get recent conversations
+            conversations = db.get_recent_conversations(user_id, limit=limit)
 
-    return result
+        # Get conversation summary
+        summary = db.get_conversation_context(user_id, lookback_days=30)
+
+        # Convert datetime objects to ISO strings
+        for conv in conversations:
+            if conv.get('created_at'):
+                conv['created_at'] = conv['created_at'].isoformat()
+
+        return {
+            "conversations": conversations,
+            "count": len(conversations),
+            "summary": summary
+        }
+
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to get conversation history: {str(e)}"
+        )
 
 
-@app.post("/api/payments/create-portal-session", response_model=PortalSessionResponse, tags=["Payments"])
-async def create_portal_session(
-    request: PortalSessionRequest,
+@app.delete("/api/tutor/history", tags=["Tutor"])
+async def clear_conversation_history(
+    before_date: Optional[str] = None,
     db: Database = Depends(get_database),
     user_id_from_token: str = Depends(verify_token),
 ):
     """
-    Create a Stripe customer portal session.
+    Clear conversation history for the authenticated user.
 
-    Returns a URL to redirect the user to Stripe's customer portal where they can
-    manage their subscription, update payment methods, view invoices, etc.
+    Query params:
+    - before_date: Optional ISO date string - only clear conversations before this date
+
+    Returns:
+    - deleted_count: Number of conversation turns deleted
+    - message: Success message
     """
     try:
         user_id = uuid.UUID(user_id_from_token)
     except Exception:
         raise HTTPException(status_code=400, detail="Invalid user_id from token")
 
-    payment_service = StripePaymentService(db)
-    result = await payment_service.create_portal_session(user_id, request.return_url)
+    try:
+        # Parse before_date if provided
+        before_datetime = None
+        if before_date:
+            try:
+                from datetime import datetime as dt
+                before_datetime = dt.fromisoformat(before_date.replace('Z', '+00:00'))
+            except Exception:
+                raise HTTPException(status_code=400, detail="Invalid date format. Use ISO 8601 format.")
 
-    return PortalSessionResponse(**result)
+        # Clear conversation history
+        deleted_count = db.clear_conversation_history(
+            user_id=user_id,
+            before_date=before_datetime
+        )
+
+        return {
+            "status": "success",
+            "message": f"Cleared {deleted_count} conversation turn(s)",
+            "deleted_count": deleted_count
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to clear conversation history: {str(e)}"
+        )
+
+
+@app.get("/api/tutor/memory-summary", tags=["Tutor"])
+async def get_memory_summary(
+    lookback_days: int = 30,
+    db: Database = Depends(get_database),
+    user_id_from_token: str = Depends(verify_token),
+):
+    """
+    Get a summary of the tutor's memory about the user.
+
+    Shows what the tutor "remembers" about past conversations,
+    including topics discussed, contexts used, and conversation patterns.
+
+    Query params:
+    - lookback_days: Number of days to look back (default 30)
+
+    Returns:
+    - total_conversations: Total number of conversation turns
+    - recent_topics: List of recent conversation contexts
+    - most_active_context: The most frequently used context type
+    - last_conversation_date: Date of last conversation
+    """
+    try:
+        user_id = uuid.UUID(user_id_from_token)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid user_id from token")
+
+    try:
+        summary = db.get_conversation_context(
+            user_id=user_id,
+            lookback_days=lookback_days
+        )
+
+        if not summary:
+            return {
+                "total_conversations": 0,
+                "recent_topics": [],
+                "most_active_context": None,
+                "last_conversation_date": None
+            }
+
+        # Extract data from summary
+        context_summary = summary.get('context_summary', {})
+
+        return {
+            "total_conversations": summary.get('total_conversations', 0),
+            "recent_topics": summary.get('recent_topics', []),
+            "most_active_context": context_summary.get('most_active_context'),
+            "last_conversation_date": context_summary.get('last_conversation_date')
+        }
+
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to get memory summary: {str(e)}"
+        )
 
 
 if __name__ == "__main__":

@@ -46,3 +46,6 @@ cryptography==44.0.0
 # Pronunciation scoring
 phonemizer==3.2.1
 numpy==1.26.4
+
+# Payment processing
+stripe==11.2.0

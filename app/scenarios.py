@@ -232,6 +232,283 @@ SCENARIO_TEMPLATES: Dict[str, ScenarioTemplate] = {
             "urgency": "moderate",
             "connecting_flights": False
         }
+    ),
+
+    # JOB INTERVIEW SCENARIOS
+    "job_interview_intro": ScenarioTemplate(
+        scenario_id="job_interview_intro",
+        title="Job Interview - Professional Introduction",
+        level_min="B1",
+        level_max="C1",
+        situation_description="You're at the beginning of a job interview. The interviewer has just welcomed you and asked you to introduce yourself professionally.",
+        user_goal="Present yourself professionally, share your background concisely, make a strong first impression, and show enthusiasm for the role.",
+        task="Give a professional self-introduction covering your name, current role/background, key achievements, and why you're interested in this position.",
+        success_criteria="Use formal register, speak for 1-2 minutes, highlight relevant experience, show confidence, connect your background to the role, maintain professional tone.",
+        difficulty_tags=["professional", "formal_register", "self_presentation", "complex_sentences", "professional_vocabulary"],
+        user_variables={
+            "current_role": "",
+            "years_experience": 0,
+            "target_position": "",
+            "key_achievement": ""
+        }
+    ),
+
+    "job_interview_strengths": ScenarioTemplate(
+        scenario_id="job_interview_strengths",
+        title="Job Interview - Strengths & Weaknesses",
+        level_min="B2",
+        level_max="C1",
+        situation_description="The interviewer asks you to describe your greatest strengths and areas for improvement. This is a classic interview question that requires thoughtful, balanced responses.",
+        user_goal="Present your strengths with confidence and examples, discuss weaknesses honestly while showing self-awareness and growth mindset.",
+        task="Describe 2-3 key strengths with specific examples, then discuss one area for improvement and what you're doing to develop it.",
+        success_criteria="Use professional vocabulary, provide concrete examples, avoid clichés, show self-awareness, demonstrate growth mindset, balance honesty with positivity.",
+        difficulty_tags=["professional", "self_reflection", "complex_sentences", "formal_register", "persuasion"],
+        user_variables={
+            "main_strength": "",
+            "strength_example": "",
+            "area_for_improvement": "",
+            "improvement_plan": ""
+        }
+    ),
+
+    "job_interview_experience": ScenarioTemplate(
+        scenario_id="job_interview_experience",
+        title="Job Interview - Describing Past Experience",
+        level_min="B2",
+        level_max="C2",
+        situation_description="The interviewer asks you to describe a challenging project or situation you handled in a previous role and what you learned from it.",
+        user_goal="Tell a compelling professional story using the STAR method (Situation, Task, Action, Result), demonstrating problem-solving skills and professional growth.",
+        task="Describe a specific professional challenge, explain your approach, detail the actions you took, and share the results and lessons learned.",
+        success_criteria="Use past tenses accurately, structure story clearly with STAR method, include specific details, show problem-solving ability, reflect on learning outcomes.",
+        difficulty_tags=["professional", "narrative", "past_tenses", "complex_sentences", "storytelling", "formal_register"],
+        user_variables={
+            "situation": "",
+            "challenge": "",
+            "actions_taken": [],
+            "results": "",
+            "lessons_learned": ""
+        }
+    ),
+
+    # TRAVEL SCENARIOS
+    "airport_security": ScenarioTemplate(
+        scenario_id="airport_security",
+        title="Going Through Airport Security",
+        level_min="A2",
+        level_max="B1",
+        situation_description="You're at airport security and the TSA officer is giving you instructions. You need to understand and follow their directions while having your documents ready.",
+        user_goal="Understand security instructions, respond to questions about your luggage and travel, follow procedures correctly, and handle any issues politely.",
+        task="Present your boarding pass and ID, answer questions about your bags and belongings, follow instructions to remove items, and go through the scanner.",
+        success_criteria="Understand imperative instructions, respond clearly to yes/no questions, use polite language, stay calm under pressure, follow multi-step directions.",
+        difficulty_tags=["transactional", "travel_vocabulary", "imperative_understanding", "question_answering", "formal_register"],
+        user_variables={
+            "destination": "",
+            "items_in_bag": [],
+            "electronics": [],
+            "liquids": False
+        }
+    ),
+
+    "taxi_ride": ScenarioTemplate(
+        scenario_id="taxi_ride",
+        title="Taking a Taxi",
+        level_min="A2",
+        level_max="B1",
+        situation_description="You need to take a taxi to get to your destination. You'll need to communicate your destination, discuss the route, and handle payment.",
+        user_goal="Clearly state your destination, confirm the route and price, make small talk if appropriate, and complete the transaction.",
+        task="Tell the driver where you want to go, ask about the fare or route, confirm arrival, and pay for the ride.",
+        success_criteria="Give clear directions, use polite requests, understand fare information, ask about time/route, thank the driver appropriately.",
+        difficulty_tags=["transactional", "travel_vocabulary", "directions", "polite_requests", "negotiation"],
+        user_variables={
+            "destination_address": "",
+            "preferred_route": "",
+            "payment_method": "cash",
+            "urgency": "moderate"
+        }
+    ),
+
+    # SOCIAL SCENARIOS
+    "meeting_neighbors": ScenarioTemplate(
+        scenario_id="meeting_neighbors",
+        title="Meeting New Neighbors",
+        level_min="A2",
+        level_max="B1",
+        situation_description="You've just moved into a new apartment or house. You meet your neighbor in the hallway or at your door and they want to introduce themselves.",
+        user_goal="Make a good first impression, exchange basic information, be friendly and approachable, establish a positive relationship.",
+        task="Introduce yourself, share where you're from and what you do, ask about them and the neighborhood, and express interest in being good neighbors.",
+        success_criteria="Use friendly informal language, ask reciprocal questions, show genuine interest, use appropriate greetings, offer basic personal information.",
+        difficulty_tags=["social", "introductions", "small_talk", "question_formation", "community"],
+        user_variables={
+            "your_name": "",
+            "where_from": "",
+            "occupation": "",
+            "moving_from": ""
+        }
+    ),
+
+    "party_smalltalk": ScenarioTemplate(
+        scenario_id="party_smalltalk",
+        title="Making Small Talk at a Party",
+        level_min="B1",
+        level_max="B2",
+        situation_description="You're at a social gathering or party and someone you don't know well starts a conversation with you. You need to keep the conversation flowing naturally.",
+        user_goal="Engage in light, casual conversation, find common ground, show interest without being intrusive, and maintain a pleasant interaction.",
+        task="Respond to small talk openers, ask follow-up questions, share appropriate personal information, discuss neutral topics (weather, food, event), and keep conversation balanced.",
+        success_criteria="Use conversational fillers and discourse markers, ask open-ended questions, show active listening, avoid controversial topics, maintain turn-taking balance.",
+        difficulty_tags=["social", "small_talk", "conversational_fluency", "question_formation", "rapport_building"],
+        user_variables={
+            "connection_to_host": "",
+            "interests": [],
+            "current_events": [],
+            "conversational_style": "balanced"
+        }
+    ),
+
+    "phone_call_friend": ScenarioTemplate(
+        scenario_id="phone_call_friend",
+        title="Casual Phone Call with a Friend",
+        level_min="A2",
+        level_max="B2",
+        situation_description="A friend calls you to catch up. You'll have a casual conversation about recent events, make plans, and chat about everyday topics.",
+        user_goal="Have a natural, friendly conversation, share updates about your life, listen to their news, and possibly make plans to meet up.",
+        task="Answer the phone, exchange greetings, talk about what you've been up to, ask about their life, and arrange to meet or continue the friendship.",
+        success_criteria="Use casual register, employ conversational expressions ('you know', 'I mean'), ask follow-up questions, share personal updates naturally, suggest plans.",
+        difficulty_tags=["social", "phone_language", "informal_register", "conversational_fluency", "friendship"],
+        user_variables={
+            "friend_name": "",
+            "last_contact": "",
+            "recent_activities": [],
+            "plan_to_suggest": ""
+        }
+    ),
+
+    # PROFESSIONAL SCENARIOS
+    "business_meeting": ScenarioTemplate(
+        scenario_id="business_meeting",
+        title="Participating in a Business Meeting",
+        level_min="B2",
+        level_max="C2",
+        situation_description="You're attending a business meeting where team members are discussing a project. You need to participate actively, share your opinions, and contribute to the discussion.",
+        user_goal="Express your ideas clearly, agree or disagree diplomatically, ask clarifying questions, and contribute meaningfully to the discussion.",
+        task="Listen to others' points, express your opinion on the topic, support your ideas with reasoning, respond to questions or objections, and help reach consensus.",
+        success_criteria="Use formal business language, employ diplomatic phrases for disagreement, structure arguments logically, use modal verbs for suggestions, maintain professional tone.",
+        difficulty_tags=["professional", "formal_register", "opinion_expression", "negotiation", "complex_sentences", "business_vocabulary"],
+        user_variables={
+            "your_role": "",
+            "meeting_topic": "",
+            "your_position": "",
+            "concerns": []
+        }
+    ),
+
+    "email_followup": ScenarioTemplate(
+        scenario_id="email_followup",
+        title="Discussing Email Communication",
+        level_min="B1",
+        level_max="C1",
+        situation_description="A colleague mentions they sent you an important email and wants to discuss it. You need to reference the email content and discuss next steps.",
+        user_goal="Show you understand the email content, discuss the issues or proposals, ask clarifying questions, and agree on action items.",
+        task="Confirm you received and read the email, discuss the main points, ask questions about unclear items, and establish what needs to be done next.",
+        success_criteria="Use appropriate phrases for referring to written communication, ask for clarification professionally, summarize key points, use future forms for action items.",
+        difficulty_tags=["professional", "formal_register", "business_vocabulary", "action_planning", "clarification"],
+        user_variables={
+            "email_topic": "",
+            "sender": "",
+            "main_points": [],
+            "questions": []
+        }
+    ),
+
+    "presentation_qa": ScenarioTemplate(
+        scenario_id="presentation_qa",
+        title="Q&A After a Presentation",
+        level_min="B2",
+        level_max="C2",
+        situation_description="You've just finished giving a presentation and now it's time for questions from the audience. You need to handle questions professionally and provide clear answers.",
+        user_goal="Answer questions clearly and confidently, handle difficult questions diplomatically, admit when you don't know something, and engage with the audience.",
+        task="Listen to audience questions, provide thoughtful answers, clarify when needed, acknowledge good questions, and handle challenging or critical questions professionally.",
+        success_criteria="Use professional language, structure answers clearly, employ phrases for buying time ('That's a great question...'), admit uncertainty gracefully, stay calm under pressure.",
+        difficulty_tags=["professional", "formal_register", "public_speaking", "complex_sentences", "persuasion", "diplomacy"],
+        user_variables={
+            "presentation_topic": "",
+            "expertise_level": "",
+            "audience_type": "mixed",
+            "controversial_aspects": []
+        }
+    ),
+
+    # DAILY LIFE SCENARIOS
+    "grocery_shopping": ScenarioTemplate(
+        scenario_id="grocery_shopping",
+        title="Shopping at a Grocery Store",
+        level_min="A1",
+        level_max="B1",
+        situation_description="You're at a grocery store and need help finding items or asking about products. A store employee is available to assist you.",
+        user_goal="Find the items you need, ask for help locating products, inquire about prices or alternatives, and complete your shopping.",
+        task="Ask where specific items are located, inquire about product details (price, size, freshness), ask for recommendations, and thank the employee.",
+        success_criteria="Use polite question forms ('Could you tell me...', 'Do you have...'), understand location directions (aisle, shelf), ask about quantities and prices clearly.",
+        difficulty_tags=["transactional", "shopping_vocabulary", "question_formation", "polite_requests", "food_vocabulary"],
+        user_variables={
+            "shopping_list": [],
+            "dietary_restrictions": [],
+            "budget": "flexible",
+            "unfamiliar_items": []
+        }
+    ),
+
+    "doctor_symptoms": ScenarioTemplate(
+        scenario_id="doctor_symptoms",
+        title="Describing Symptoms to a Doctor",
+        level_min="B1",
+        level_max="C1",
+        situation_description="You're at a doctor's appointment because you haven't been feeling well. The doctor asks you to describe your symptoms in detail.",
+        user_goal="Accurately describe your symptoms, answer the doctor's questions, explain when symptoms started, and understand the diagnosis and treatment.",
+        task="Describe what hurts and how it feels, explain when symptoms began, mention severity and frequency, answer medical questions, and understand the doctor's advice.",
+        success_criteria="Use medical vocabulary correctly (pain, ache, sore, fever), describe duration and intensity, use present perfect for recent symptoms, understand medical instructions.",
+        difficulty_tags=["transactional", "health_vocabulary", "symptom_description", "present_perfect", "formal_register"],
+        user_variables={
+            "main_symptom": "",
+            "duration": "",
+            "severity": "moderate",
+            "other_symptoms": [],
+            "medications": []
+        }
+    ),
+
+    "bank_account": ScenarioTemplate(
+        scenario_id="bank_account",
+        title="Opening a Bank Account",
+        level_min="B1",
+        level_max="B2",
+        situation_description="You want to open a new bank account. You're meeting with a bank representative who will explain the process and account options.",
+        user_goal="Understand different account types, ask about fees and requirements, provide necessary information, and complete the application process.",
+        task="Explain what type of account you need, ask about interest rates and fees, understand requirements and documents needed, and decide which account to open.",
+        success_criteria="Use financial vocabulary (checking account, savings, interest, fees, deposit), ask comparative questions, understand complex information, provide personal details clearly.",
+        difficulty_tags=["transactional", "financial_vocabulary", "formal_register", "comparatives", "decision_making"],
+        user_variables={
+            "account_type": "checking",
+            "initial_deposit": "",
+            "usage_plans": [],
+            "documents_available": []
+        }
+    ),
+
+    "tech_support": ScenarioTemplate(
+        scenario_id="tech_support",
+        title="Getting Tech Support Help",
+        level_min="B1",
+        level_max="B2",
+        situation_description="You're having a technical problem with a device or service. You call customer support and need to explain the issue so they can help you fix it.",
+        user_goal="Clearly describe the technical problem, follow troubleshooting instructions, ask for clarification when needed, and resolve the issue.",
+        task="Explain what's not working, describe what you've already tried, follow the support agent's instructions step-by-step, and confirm when the issue is resolved.",
+        success_criteria="Use technical vocabulary appropriately, describe problems clearly, understand imperative instructions, ask for clarification, confirm understanding of steps.",
+        difficulty_tags=["transactional", "tech_vocabulary", "problem_description", "following_instructions", "formal_register"],
+        user_variables={
+            "device_type": "",
+            "problem_description": "",
+            "error_messages": [],
+            "troubleshooting_done": []
+        }
     )
 }
 

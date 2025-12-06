@@ -48,21 +48,30 @@ from typing import List, Dict, Optional
 from app.models import Error, TutorResponse, ErrorType
 
 
-TUTOR_SYSTEM_PROMPT = """You are an English tutor AI for SpeakSharp. Your role is to help learners improve their English.
+TUTOR_SYSTEM_PROMPT = """You are Alex, a warm and encouraging English tutor for SpeakSharp. You're passionate about helping people communicate confidently in English, and you genuinely care about each learner's progress.
 
-PERSONA:
-- Supportive but direct
-- Corrective but not nitpicky
-- Task-oriented, not chatty
-- Friendly but firm expert
-- Always goal-oriented
+YOUR PERSONALITY:
+- Warm, patient, and genuinely encouraging - like a supportive friend who happens to be a great teacher
+- Use natural conversational language with filler words ("Well...", "I see", "That's interesting!")
+- Celebrate improvements and reference progress ("You're getting better at this!", "I noticed you used that correctly this time!")
+- Make corrections feel helpful, not critical ("Let me help you with something small here...")
+- Show enthusiasm when learners do well ("Nice!", "Exactly!", "You got it!")
+- Be human - occasionally use gentle humor, express empathy, vary your phrasing
 
-CORRECTION STRATEGY:
-1. Selectively correct errors blocking clarity or fossilized patterns
-2. Reformulate user sentences naturally
-3. Offer short, simple explanations with examples
-4. Don't interrupt every sentence
-5. Avoid metalinguistic jargon
+NATURAL CONVERSATION STYLE:
+- Start responses with natural transitions: "Great question!", "I hear you!", "Hmm, let me think about that..."
+- Use encouraging phrases: "You're on the right track", "Almost there!", "I can see what you mean"
+- Show you're listening: "So if I understand correctly...", "You mentioned that..."
+- Vary your praise: Don't repeat the same "Good job!" every time
+- Sound natural, not robotic - like a real person would speak
+
+CORRECTION APPROACH:
+1. Lead with something positive when possible ("I love how you used [X]!")
+2. Then gently introduce corrections ("One small thing - we usually say...")
+3. Focus on 1-3 high-impact errors that block clarity or show fossilized patterns
+4. Reformulate sentences naturally, don't just point out mistakes
+5. Keep explanations simple and example-based
+6. Don't over-correct - let minor errors slide if communication is clear
 
 ERROR TYPES TO TAG:
 - grammar: article errors, tense errors, agreement, word order, etc.
@@ -73,18 +82,28 @@ ERROR TYPES TO TAG:
 
 TURN MANAGEMENT:
 - Keep learner speaking 60-70% of time
-- Use short, clear turns
-- Avoid monologues
+- Use short, conversational turns
+- Ask follow-up questions to keep them talking
+- Reference what they've said earlier in the conversation
+
+CONVERSATION MEMORY & CONTINUITY:
+- You may have access to past conversation history in the context data
+- Reference previous sessions naturally when relevant (e.g., "Last time you mentioned traveling to Japan...")
+- Track recurring errors and remind learners gently ("I notice you're still working on articles - that's totally normal!")
+- Build on previous learning (e.g., "Remember we practiced past tense yesterday? Let's use it here...")
+- Make the learner feel remembered and known ("How did that job interview go?", "Still working on that presentation?")
+- Don't force references - only use them when they feel natural and helpful
+- Use memory to show genuine interest and track their learning journey
 
 OUTPUT FORMAT (strict JSON):
 {
-  "message": "your response to the learner",
+  "message": "your warm, natural response to the learner",
   "errors": [
     {
       "type": "grammar|vocab|fluency|pronunciation_placeholder|structure",
       "user_sentence": "what they said",
       "corrected_sentence": "corrected version",
-      "explanation": "brief explanation"
+      "explanation": "brief, friendly explanation"
     }
   ],
   "micro_task": "optional micro-task for practice"
@@ -92,10 +111,11 @@ OUTPUT FORMAT (strict JSON):
 
 RULES:
 - Always output valid JSON
+- Sound like a real, caring human teacher
+- Vary your language - don't be repetitive
 - Tag 1-3 most important errors per turn
-- Generate 1 micro-task when appropriate
-- Be concise and clear
-- Focus on high-impact corrections
+- Balance encouragement with helpful corrections
+- Make learners feel they're improving, not failing
 """
 
 
@@ -121,19 +141,88 @@ def call_llm_tutor(user_text: str, context: dict | None = None) -> TutorResponse
 
 
 class TutorAgent:
-    def __init__(self, system_prompt: str = TUTOR_SYSTEM_PROMPT):
+    def __init__(self, system_prompt: str = TUTOR_SYSTEM_PROMPT, user_id: str = None, db = None):
         self.system_prompt = system_prompt
         self.conversation_history: List[Dict[str, str]] = []
+        self.user_id = user_id
+        self.db = db
+        self.conversation_memory_loaded = False
+        self.past_conversations = []
+        self.conversation_summary = None
+
+    def load_conversation_memory(self, user_id: str = None):
+        """
+        Load recent conversation history from the database.
+        This gives the tutor context about past sessions.
+        """
+        if not self.db:
+            return
+
+        uid = user_id or self.user_id
+        if not uid:
+            return
+
+        try:
+            import uuid
+            user_uuid = uuid.UUID(uid)
+
+            # Get recent conversations (last 10 turns)
+            recent_convos = self.db.get_recent_conversations(user_uuid, limit=10)
+
+            # Get conversation context summary
+            context_summary = self.db.get_conversation_context(user_uuid, lookback_days=7)
+
+            # Store in memory for the tutor to reference
+            self.past_conversations = recent_convos
+            self.conversation_summary = context_summary
+            self.conversation_memory_loaded = True
+
+        except Exception as e:
+            print(f"Warning: Failed to load conversation memory: {e}")
+            self.past_conversations = []
+            self.conversation_summary = None
+
+    def _build_memory_enriched_context(self, context: Dict) -> Dict:
+        """
+        Enrich the context with conversation memory.
+        Adds information about past conversations to help the tutor remember.
+        """
+        if not self.conversation_memory_loaded:
+            return context
+
+        # Add conversation memory to context
+        if self.past_conversations:
+            context['has_conversation_history'] = True
+            context['recent_conversation_count'] = len(self.past_conversations)
+
+            # Build a summary of recent conversations
+            recent_summary = []
+            for conv in self.past_conversations[:5]:  # Last 5 turns
+                recent_summary.append({
+                    'user_said': conv.get('user_message', '')[:100],  # Truncate to 100 chars
+                    'tutor_said': conv.get('tutor_response', '')[:100],
+                    'context_type': conv.get('context_type'),
+                    'when': str(conv.get('created_at')) if conv.get('created_at') else None
+                })
+
+            context['recent_conversation_summary'] = recent_summary
+
+        if self.conversation_summary:
+            context['conversation_summary'] = self.conversation_summary
+
+        return context
 
     def process_user_input(self, user_text: str, context: Dict = None) -> TutorResponse:
         """
         Process user input through two-layer analysis: heuristic + LLM.
 
         Pipeline:
-        1. Heuristic layer: Fast regex-based error detection
-        2. LLM layer: Contextual AI analysis
-        3. Merge results: Combine errors from both layers
-        4. Generate response: Use LLM message with merged errors
+        1. Load conversation memory if available
+        2. Enrich context with past conversation data
+        3. Heuristic layer: Fast regex-based error detection
+        4. LLM layer: Contextual AI analysis with memory
+        5. Merge results: Combine errors from both layers
+        6. Generate response: Use LLM message with merged errors
 
         Args:
             user_text: The learner's input text
@@ -144,6 +233,13 @@ class TutorAgent:
         """
         if context is None:
             context = {}
+
+        # Load conversation memory if not already loaded
+        if not self.conversation_memory_loaded and self.user_id and self.db:
+            self.load_conversation_memory()
+
+        # Enrich context with conversation memory
+        context = self._build_memory_enriched_context(context)
 
         self.conversation_history.append({
             "role": "user",
@@ -287,19 +383,47 @@ class TutorAgent:
         return errors
 
     def _generate_correction_message(self, user_text: str, errors: List[Error]) -> str:
-        """Generate a correction message."""
+        """Generate a warm, natural correction message."""
+        import random
+
+        # Natural conversation starters
+        starters = [
+            "I understood you perfectly!",
+            "I hear what you're saying!",
+            "Good effort!",
+            "Nice try!",
+            "You're on the right track!"
+        ]
+
         if len(errors) == 1:
-            return f"Good attempt! Let me help with one thing: {errors[0].corrected_sentence}. {errors[0].explanation} Try again?"
+            lead_ins = [
+                "Just one small thing -",
+                "Let me help with something quick -",
+                "One tiny adjustment -",
+                "Here's a little tip -"
+            ]
+            return f"{random.choice(starters)} {random.choice(lead_ins)} {errors[0].corrected_sentence}. {errors[0].explanation} Want to try that again?"
         else:
-            return f"I understood you! A couple of corrections: {errors[0].corrected_sentence}. Can you try saying that again?"
+            lead_ins = [
+                "A couple of quick tweaks:",
+                "Let me share a couple of things:",
+                "Two small adjustments here:",
+            ]
+            return f"{random.choice(starters)} {random.choice(lead_ins)} {errors[0].corrected_sentence}. {errors[0].explanation} Give it another shot?"
 
     def _generate_positive_response(self, user_text: str) -> str:
-        """Generate positive response for error-free input."""
+        """Generate warm, varied positive responses."""
         responses = [
-            "Perfect! That was well said.",
-            "Excellent! Your grammar is correct.",
-            "Great job! Very natural.",
-            "Nice work! Clear and correct."
+            "Perfect! That was really well said.",
+            "Excellent! You nailed that one.",
+            "Great job! Very natural sounding.",
+            "Nice! I wouldn't change a thing.",
+            "Spot on! Your English is really improving.",
+            "That's it! Exactly right.",
+            "Wonderful! You're getting the hang of this.",
+            "Fantastic! Keep that up.",
+            "Beautiful! That's exactly how a native speaker would say it.",
+            "Yes! That's perfect English right there."
         ]
         import random
         return random.choice(responses)

@@ -16,14 +16,49 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, HTTPException, Depends, File, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
+import json
+import base64
 
 from app.db import Database, get_db
 from app.tutor_agent import TutorAgent
 from app.voice_session import VoiceSession
 from app.config import load_config
 from app.models import TutorResponse
-from app.auth import verify_token, get_or_create_user
+from app.auth import verify_token, get_or_create_user, add_user_xp, get_user_xp
+from app.diagnostic import (
+    DiagnosticSession, DiagnosticAnswer, DiagnosticEngine,
+    DiagnosticRepository, seed_initial_mastery,
+    get_all_diagnostic_exercises, is_diagnostic_exercise
+)
+from app.exercises import EXERCISES, get_exercises_by_skill_key
+from app.thinking_engine import thinking_engine, ThinkingSession, ThinkingTurn
+import random
+import time
+
+# Simple in-memory cache to prevent XP abuse (prevents re-submission of same exercise)
+# Key: "user_id:exercise_id", Value: timestamp of correct answer
+# Entries expire after 1 hour
+_exercise_xp_cache: Dict[str, float] = {}
+_EXERCISE_XP_CACHE_TTL = 3600  # 1 hour
+
+def _can_earn_xp(user_id: str, exercise_id: str) -> bool:
+    """Check if user can earn XP for this exercise (not already answered correctly recently)."""
+    cache_key = f"{user_id}:{exercise_id}"
+    now = time.time()
+
+    # Clean expired entries (lazy cleanup)
+    expired_keys = [k for k, v in _exercise_xp_cache.items() if now - v > _EXERCISE_XP_CACHE_TTL]
+    for k in expired_keys:
+        del _exercise_xp_cache[k]
+
+    return cache_key not in _exercise_xp_cache
+
+def _mark_xp_earned(user_id: str, exercise_id: str):
+    """Mark that user earned XP for this exercise."""
+    cache_key = f"{user_id}:{exercise_id}"
+    _exercise_xp_cache[cache_key] = time.time()
 
 
 # Pydantic Models for API
@@ -81,9 +116,18 @@ class UserProfileResponse(BaseModel):
     """Response model for user profile."""
     user_id: uuid.UUID
     level: str
-    native_language: Optional[str]
-    goals: Dict[str, Any]
-    interests: List[str]
+    native_language: Optional[str] = None
+    goals: Optional[List[str]] = None
+    interests: Optional[List[str]] = None
+    daily_time_goal: Optional[int] = None
+    onboarding_completed: bool = False
+    full_name: Optional[str] = None
+    trial_start_date: Optional[datetime] = None
+    trial_end_date: Optional[datetime] = None
+    subscription_status: Optional[str] = None
+    subscription_tier: Optional[str] = None
+    is_tester: bool = False
+    total_xp: int = 0
     created_at: datetime
     updated_at: datetime
 
@@ -93,7 +137,7 @@ class CreateUserRequest(BaseModel):
     user_id: Optional[uuid.UUID] = None
     level: str = "A1"
     native_language: Optional[str] = None
-    goals: Optional[Dict[str, Any]] = None
+    goals: Optional[List[str]] = None
     interests: Optional[List[str]] = None
 
 
@@ -101,6 +145,24 @@ class UpdateProfileRequest(BaseModel):
     """Request model for updating user profile."""
     level: Optional[str] = None
     native_language: Optional[str] = None
+
+
+class VoicePreferences(BaseModel):
+    """Voice preferences model."""
+    voice: str = "alloy"
+    speech_speed: float = 1.0
+    auto_play_responses: bool = True
+    show_transcription: bool = True
+    microphone_sensitivity: float = 0.5
+
+
+class UpdateVoicePreferencesRequest(BaseModel):
+    """Request model for updating voice preferences."""
+    voice: Optional[str] = None
+    speech_speed: Optional[float] = None
+    auto_play_responses: Optional[bool] = None
+    show_transcription: Optional[bool] = None
+    microphone_sensitivity: Optional[float] = None
 
 
 class HealthResponse(BaseModel):
@@ -113,6 +175,175 @@ class HealthResponse(BaseModel):
 # Application lifecycle
 
 
+def run_migrations(db):
+    """Run database migrations on startup."""
+    try:
+        with db.get_connection() as conn:
+            with conn.cursor() as cur:
+                # Migration 006: Add onboarding_completed and full_name
+                cur.execute("""
+                    ALTER TABLE user_profiles
+                    ADD COLUMN IF NOT EXISTS onboarding_completed BOOLEAN DEFAULT FALSE;
+                """)
+                cur.execute("""
+                    ALTER TABLE user_profiles
+                    ADD COLUMN IF NOT EXISTS full_name VARCHAR(255);
+                """)
+                # Set existing users as having completed onboarding
+                cur.execute("""
+                    UPDATE user_profiles
+                    SET onboarding_completed = TRUE
+                    WHERE onboarding_completed IS NULL OR onboarding_completed = FALSE;
+                """)
+
+                # Migration 007: Add voice preferences
+                cur.execute("""
+                    ALTER TABLE user_profiles
+                    ADD COLUMN IF NOT EXISTS voice_preferences JSONB DEFAULT '{"voice": "alloy", "speech_speed": 1.0, "auto_play_responses": true, "show_transcription": true, "microphone_sensitivity": 0.5}'::jsonb;
+                """)
+
+                # Migration 009: Daily Challenges
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS daily_challenge_progress (
+                        user_id UUID REFERENCES user_profiles(user_id) ON DELETE CASCADE,
+                        challenge_date DATE NOT NULL,
+                        challenge_type VARCHAR(50) NOT NULL,
+                        progress INTEGER DEFAULT 0,
+                        goal INTEGER NOT NULL,
+                        completed BOOLEAN DEFAULT FALSE,
+                        completed_at TIMESTAMP,
+                        created_at TIMESTAMP DEFAULT NOW(),
+                        updated_at TIMESTAMP DEFAULT NOW(),
+                        PRIMARY KEY (user_id, challenge_date)
+                    );
+                """)
+
+                cur.execute("""
+                    CREATE INDEX IF NOT EXISTS idx_daily_challenge_user_date
+                    ON daily_challenge_progress(user_id, challenge_date DESC);
+                """)
+
+                cur.execute("""
+                    CREATE INDEX IF NOT EXISTS idx_daily_challenge_completed
+                    ON daily_challenge_progress(user_id, completed, challenge_date DESC);
+                """)
+
+                # Migration 010: Learning Path System
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS learning_units (
+                        unit_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                        unit_number INTEGER NOT NULL,
+                        level VARCHAR(10) NOT NULL,
+                        title VARCHAR(255) NOT NULL,
+                        description TEXT,
+                        icon VARCHAR(50),
+                        color VARCHAR(20),
+                        order_index INTEGER NOT NULL,
+                        is_locked BOOLEAN DEFAULT TRUE,
+                        prerequisite_unit_id UUID REFERENCES learning_units(unit_id),
+                        estimated_time_minutes INTEGER,
+                        metadata JSONB,
+                        created_at TIMESTAMP DEFAULT NOW(),
+                        updated_at TIMESTAMP DEFAULT NOW(),
+                        UNIQUE(level, unit_number)
+                    );
+                """)
+
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS learning_lessons (
+                        lesson_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                        unit_id UUID REFERENCES learning_units(unit_id) ON DELETE CASCADE,
+                        lesson_number INTEGER NOT NULL,
+                        title VARCHAR(255) NOT NULL,
+                        description TEXT,
+                        lesson_type VARCHAR(50) DEFAULT 'standard',
+                        order_index INTEGER NOT NULL,
+                        xp_reward INTEGER DEFAULT 10,
+                        is_locked BOOLEAN DEFAULT TRUE,
+                        prerequisite_lesson_id UUID REFERENCES learning_lessons(lesson_id),
+                        estimated_time_minutes INTEGER DEFAULT 5,
+                        content JSONB,
+                        metadata JSONB,
+                        created_at TIMESTAMP DEFAULT NOW(),
+                        updated_at TIMESTAMP DEFAULT NOW(),
+                        UNIQUE(unit_id, lesson_number)
+                    );
+                """)
+
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS lesson_exercises (
+                        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                        lesson_id UUID REFERENCES learning_lessons(lesson_id) ON DELETE CASCADE,
+                        exercise_id VARCHAR(100) NOT NULL,
+                        order_index INTEGER NOT NULL,
+                        is_required BOOLEAN DEFAULT TRUE,
+                        created_at TIMESTAMP DEFAULT NOW(),
+                        UNIQUE(lesson_id, order_index)
+                    );
+                """)
+
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS user_lesson_progress (
+                        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                        user_id UUID REFERENCES user_profiles(user_id) ON DELETE CASCADE,
+                        lesson_id UUID REFERENCES learning_lessons(lesson_id) ON DELETE CASCADE,
+                        started_at TIMESTAMP DEFAULT NOW(),
+                        completed_at TIMESTAMP,
+                        completed BOOLEAN DEFAULT FALSE,
+                        score INTEGER,
+                        mistakes_count INTEGER DEFAULT 0,
+                        time_spent_seconds INTEGER DEFAULT 0,
+                        exercises_completed INTEGER DEFAULT 0,
+                        total_exercises INTEGER,
+                        current_exercise_index INTEGER DEFAULT 0,
+                        metadata JSONB,
+                        UNIQUE(user_id, lesson_id)
+                    );
+                """)
+
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS user_unit_progress (
+                        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                        user_id UUID REFERENCES user_profiles(user_id) ON DELETE CASCADE,
+                        unit_id UUID REFERENCES learning_units(unit_id) ON DELETE CASCADE,
+                        started_at TIMESTAMP DEFAULT NOW(),
+                        completed_at TIMESTAMP,
+                        completed BOOLEAN DEFAULT FALSE,
+                        lessons_completed INTEGER DEFAULT 0,
+                        total_lessons INTEGER,
+                        test_taken BOOLEAN DEFAULT FALSE,
+                        test_score INTEGER,
+                        test_passed BOOLEAN DEFAULT FALSE,
+                        metadata JSONB,
+                        UNIQUE(user_id, unit_id)
+                    );
+                """)
+
+                cur.execute("""
+                    CREATE INDEX IF NOT EXISTS idx_learning_units_level ON learning_units(level, order_index);
+                """)
+                cur.execute("""
+                    CREATE INDEX IF NOT EXISTS idx_learning_lessons_unit ON learning_lessons(unit_id, order_index);
+                """)
+                cur.execute("""
+                    CREATE INDEX IF NOT EXISTS idx_user_lesson_progress_user ON user_lesson_progress(user_id, completed);
+                """)
+                cur.execute("""
+                    CREATE INDEX IF NOT EXISTS idx_user_unit_progress_user ON user_unit_progress(user_id, completed);
+                """)
+
+                # Migration 011: Add total_xp to user_profiles
+                cur.execute("""
+                    ALTER TABLE user_profiles
+                    ADD COLUMN IF NOT EXISTS total_xp INTEGER DEFAULT 0;
+                """)
+
+                conn.commit()
+                print("✓ Database migrations applied")
+    except Exception as e:
+        print(f"⚠️  Migration error (may already exist): {e}")
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Application lifespan manager."""
@@ -121,6 +352,7 @@ async def lifespan(app: FastAPI):
     db = get_db()
     if db.health_check():
         print("✓ Database connection successful")
+        run_migrations(db)
     else:
         print("⚠️  Database connection failed - some features may not work")
 
@@ -186,6 +418,200 @@ async def health_check(db: Database = Depends(get_database)):
     )
 
 
+@app.post("/admin/migrate/008", tags=["Admin"])
+async def run_migration_008(db: Database = Depends(get_database)):
+    """
+    Run migration 008 to create conversation_history table.
+    This is a one-time endpoint - can be removed after migration.
+    """
+    migration_sql = """
+    -- Migration 008: Conversation Memory System
+    CREATE TABLE IF NOT EXISTS conversation_history (
+      conversation_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      user_id UUID REFERENCES user_profiles(user_id) ON DELETE CASCADE,
+      session_id UUID REFERENCES sessions(session_id) ON DELETE SET NULL,
+      turn_number INTEGER NOT NULL,
+      user_message TEXT NOT NULL,
+      tutor_response TEXT NOT NULL,
+      context_type VARCHAR(50),
+      context_id VARCHAR(100),
+      created_at TIMESTAMP DEFAULT NOW(),
+      metadata JSONB DEFAULT '{}'::JSONB
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_conversation_user_created ON conversation_history(user_id, created_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_conversation_session ON conversation_history(session_id);
+    CREATE INDEX IF NOT EXISTS idx_conversation_context ON conversation_history(user_id, context_type, context_id);
+
+    CREATE OR REPLACE FUNCTION get_recent_conversations(p_user_id UUID, p_limit INTEGER DEFAULT 10)
+    RETURNS TABLE (conversation_id UUID, turn_number INTEGER, user_message TEXT, tutor_response TEXT, context_type VARCHAR, context_id VARCHAR, created_at TIMESTAMP, metadata JSONB)
+    AS $$ BEGIN RETURN QUERY SELECT ch.conversation_id, ch.turn_number, ch.user_message, ch.tutor_response, ch.context_type, ch.context_id, ch.created_at, ch.metadata FROM conversation_history ch WHERE ch.user_id = p_user_id ORDER BY ch.created_at DESC LIMIT p_limit; END; $$ LANGUAGE plpgsql;
+
+    CREATE OR REPLACE FUNCTION save_conversation_turn(p_user_id UUID, p_session_id UUID, p_turn_number INTEGER, p_user_message TEXT, p_tutor_response TEXT, p_context_type VARCHAR DEFAULT NULL, p_context_id VARCHAR DEFAULT NULL, p_metadata JSONB DEFAULT '{}'::JSONB)
+    RETURNS UUID AS $$ DECLARE v_conversation_id UUID; BEGIN v_conversation_id := gen_random_uuid(); INSERT INTO conversation_history (conversation_id, user_id, session_id, turn_number, user_message, tutor_response, context_type, context_id, metadata) VALUES (v_conversation_id, p_user_id, p_session_id, p_turn_number, p_user_message, p_tutor_response, p_context_type, p_context_id, p_metadata); RETURN v_conversation_id; END; $$ LANGUAGE plpgsql;
+
+    CREATE OR REPLACE FUNCTION clear_conversation_history(p_user_id UUID, p_before_date TIMESTAMP DEFAULT NULL)
+    RETURNS INTEGER AS $$ DECLARE v_deleted_count INTEGER; BEGIN IF p_before_date IS NULL THEN DELETE FROM conversation_history WHERE user_id = p_user_id; ELSE DELETE FROM conversation_history WHERE user_id = p_user_id AND created_at < p_before_date; END IF; GET DIAGNOSTICS v_deleted_count = ROW_COUNT; RETURN v_deleted_count; END; $$ LANGUAGE plpgsql;
+    """
+
+    try:
+        with db.get_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(migration_sql)
+                conn.commit()
+    except Exception as e:
+        import traceback
+        raise HTTPException(status_code=500, detail=f"Migration SQL failed: {type(e).__name__}: {str(e)}\n{traceback.format_exc()}")
+
+    try:
+        # Verify table was created
+        with db.get_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    SELECT EXISTS (
+                        SELECT FROM information_schema.tables
+                        WHERE table_schema = 'public'
+                        AND table_name = 'conversation_history'
+                    ) as table_exists;
+                """)
+                result = cur.fetchone()
+                # Handle both dict (dict_row) and tuple results
+                if isinstance(result, dict):
+                    table_exists = result.get('table_exists', result.get('exists', False))
+                else:
+                    table_exists = result[0] if result else False
+
+        return {
+            "status": "success",
+            "message": "Migration 008 applied successfully",
+            "table_created": table_exists
+        }
+    except Exception as e:
+        import traceback
+        raise HTTPException(status_code=500, detail=f"Verification failed: {type(e).__name__}: {str(e)}")
+
+
+@app.post("/admin/migrate/009", tags=["Admin"])
+async def run_migration_009(db: Database = Depends(get_database)):
+    """
+    Run migration 009 to create skill_definitions table and BKT functions.
+    """
+    migration_sql = """
+    -- Master skill definitions (static, ~120 skills for MVP)
+    CREATE TABLE IF NOT EXISTS skill_definitions (
+      skill_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      skill_key VARCHAR(100) UNIQUE NOT NULL,
+      domain VARCHAR(50) NOT NULL,
+      category VARCHAR(100) NOT NULL,
+      name_en VARCHAR(255) NOT NULL,
+      description_en TEXT,
+      cefr_level VARCHAR(10) NOT NULL,
+      difficulty FLOAT DEFAULT 0.5,
+      is_active BOOLEAN DEFAULT TRUE,
+      created_at TIMESTAMP DEFAULT NOW()
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_skill_definitions_domain ON skill_definitions(domain);
+    CREATE INDEX IF NOT EXISTS idx_skill_definitions_level ON skill_definitions(cefr_level);
+    CREATE INDEX IF NOT EXISTS idx_skill_definitions_key ON skill_definitions(skill_key);
+
+    -- Add BKT columns to existing skill_graph_nodes
+    ALTER TABLE skill_graph_nodes ADD COLUMN IF NOT EXISTS p_learned FLOAT DEFAULT 0.1;
+    ALTER TABLE skill_graph_nodes ADD COLUMN IF NOT EXISTS p_transit FLOAT DEFAULT 0.15;
+
+    -- Function to update skill mastery using BKT
+    CREATE OR REPLACE FUNCTION update_skill_bkt(p_user_id UUID, p_skill_key VARCHAR, p_correct BOOLEAN)
+    RETURNS FLOAT AS $$
+    DECLARE
+      v_p_learned FLOAT; v_p_transit FLOAT; v_p_guess FLOAT := 0.2; v_p_slip FLOAT := 0.1;
+      v_posterior FLOAT; v_new_p_learned FLOAT;
+    BEGIN
+      SELECT p_learned, p_transit INTO v_p_learned, v_p_transit FROM skill_graph_nodes WHERE user_id = p_user_id AND skill_key = p_skill_key;
+      IF NOT FOUND THEN v_p_learned := 0.1; v_p_transit := 0.15; END IF;
+      IF p_correct THEN
+        v_posterior := (v_p_learned * (1 - v_p_slip)) / (v_p_learned * (1 - v_p_slip) + (1 - v_p_learned) * v_p_guess);
+      ELSE
+        v_posterior := (v_p_learned * v_p_slip) / (v_p_learned * v_p_slip + (1 - v_p_learned) * (1 - v_p_guess));
+      END IF;
+      v_new_p_learned := v_posterior + (1 - v_posterior) * v_p_transit;
+      INSERT INTO skill_graph_nodes (node_id, user_id, skill_category, skill_key, mastery_score, p_learned, p_transit, practice_count, success_count, error_count, last_practiced)
+      VALUES (gen_random_uuid(), p_user_id, 'mastery', p_skill_key, v_new_p_learned * 100, v_new_p_learned, v_p_transit, 1, CASE WHEN p_correct THEN 1 ELSE 0 END, CASE WHEN NOT p_correct THEN 1 ELSE 0 END, NOW())
+      ON CONFLICT (user_id, skill_key) DO UPDATE SET
+        p_learned = v_new_p_learned, mastery_score = v_new_p_learned * 100, practice_count = skill_graph_nodes.practice_count + 1,
+        success_count = skill_graph_nodes.success_count + CASE WHEN p_correct THEN 1 ELSE 0 END,
+        error_count = skill_graph_nodes.error_count + CASE WHEN NOT p_correct THEN 1 ELSE 0 END, last_practiced = NOW();
+      RETURN v_new_p_learned;
+    END; $$ LANGUAGE plpgsql;
+
+    -- Function to get recommended skills
+    CREATE OR REPLACE FUNCTION get_recommended_skills(p_user_id UUID, p_limit INTEGER DEFAULT 3)
+    RETURNS TABLE (skill_key VARCHAR, name_en VARCHAR, domain VARCHAR, cefr_level VARCHAR, p_learned FLOAT, practice_count INTEGER) AS $$
+    BEGIN RETURN QUERY
+      SELECT sd.skill_key, sd.name_en, sd.domain, sd.cefr_level, COALESCE(sgn.p_learned, 0.1) as p_learned, COALESCE(sgn.practice_count, 0) as practice_count
+      FROM skill_definitions sd LEFT JOIN skill_graph_nodes sgn ON sd.skill_key = sgn.skill_key AND sgn.user_id = p_user_id
+      WHERE sd.is_active = TRUE ORDER BY COALESCE(sgn.p_learned, 0.1) ASC, sd.difficulty ASC LIMIT p_limit;
+    END; $$ LANGUAGE plpgsql;
+
+    -- Function to get skill mastery overview
+    CREATE OR REPLACE FUNCTION get_skill_mastery_overview(p_user_id UUID)
+    RETURNS TABLE (total_skills INTEGER, skills_practiced INTEGER, mastered_count INTEGER, in_progress_count INTEGER, struggling_count INTEGER, avg_mastery FLOAT) AS $$
+    BEGIN RETURN QUERY
+      SELECT (SELECT COUNT(*)::INTEGER FROM skill_definitions WHERE is_active = TRUE),
+        COUNT(sgn.skill_key)::INTEGER,
+        COUNT(CASE WHEN sgn.p_learned >= 0.85 THEN 1 END)::INTEGER,
+        COUNT(CASE WHEN sgn.p_learned >= 0.3 AND sgn.p_learned < 0.85 THEN 1 END)::INTEGER,
+        COUNT(CASE WHEN sgn.p_learned < 0.3 THEN 1 END)::INTEGER,
+        COALESCE(AVG(sgn.p_learned), 0.1)
+      FROM skill_graph_nodes sgn WHERE sgn.user_id = p_user_id AND sgn.skill_key IN (SELECT skill_key FROM skill_definitions WHERE is_active = TRUE);
+    END; $$ LANGUAGE plpgsql;
+    """
+
+    try:
+        with db.get_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(migration_sql)
+                conn.commit()
+        return {"status": "success", "message": "Migration 009 applied"}
+    except Exception as e:
+        import traceback
+        raise HTTPException(status_code=500, detail=f"Migration failed: {str(e)}")
+
+
+@app.post("/admin/seed/skills", tags=["Admin"])
+async def seed_skills(db: Database = Depends(get_database)):
+    """
+    Seed skill definitions into the database.
+    """
+    try:
+        from app.skills import ALL_SKILLS, SKILL_COUNT
+        skill_list = list(ALL_SKILLS)
+    except Exception as e:
+        import traceback
+        raise HTTPException(status_code=500, detail=f"Import failed: {type(e).__name__}: {str(e)}\n{traceback.format_exc()}")
+
+    try:
+        with db.get_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute("DELETE FROM skill_definitions;")
+                inserted = 0
+                for skill in skill_list:
+                    cur.execute("""
+                        INSERT INTO skill_definitions (skill_key, domain, category, name_en, description_en, cefr_level, difficulty)
+                        VALUES (%s, %s, %s, %s, %s, %s, %s)
+                        ON CONFLICT (skill_key) DO UPDATE SET domain = EXCLUDED.domain, category = EXCLUDED.category,
+                        name_en = EXCLUDED.name_en, description_en = EXCLUDED.description_en, cefr_level = EXCLUDED.cefr_level, difficulty = EXCLUDED.difficulty
+                    """, (skill.skill_key, skill.domain, skill.category, skill.name_en, skill.description_en, skill.cefr_level, skill.difficulty))
+                    inserted += 1
+                conn.commit()
+                cur.execute("SELECT COUNT(*) as cnt FROM skill_definitions;")
+                result = cur.fetchone()
+                count = result['cnt'] if isinstance(result, dict) else result[0]
+        return {"status": "success", "inserted": inserted, "db_count": count, "expected": SKILL_COUNT}
+    except Exception as e:
+        import traceback
+        raise HTTPException(status_code=500, detail=f"DB error: {type(e).__name__}: {str(e)}\n{traceback.format_exc()}")
+
+
 # User Profile Endpoints
 
 
@@ -220,28 +646,6 @@ async def create_user(
         raise HTTPException(status_code=500, detail=f"Failed to create user: {str(e)}")
 
 
-@app.get("/api/users/{user_id}", response_model=UserProfileResponse, tags=["Users"])
-async def get_user(
-    user_id: uuid.UUID,
-    db: Database = Depends(get_database)
-):
-    """
-    Get user profile by ID.
-
-    Args:
-        user_id: User UUID
-
-    Returns:
-        User profile
-    """
-    user = db.get_user(user_id)
-
-    if not user:
-        raise HTTPException(status_code=404, detail="User not found")
-
-    return UserProfileResponse(**user)
-
-
 @app.get("/api/users/me", response_model=UserProfileResponse, tags=["Users"])
 async def get_current_user(
     db: Database = Depends(get_database),
@@ -263,6 +667,28 @@ async def get_current_user(
 
     # Auto-create user profile if doesn't exist
     user = get_or_create_user(str(user_id))
+
+    return UserProfileResponse(**user)
+
+
+@app.get("/api/users/{user_id}", response_model=UserProfileResponse, tags=["Users"])
+async def get_user(
+    user_id: uuid.UUID,
+    db: Database = Depends(get_database)
+):
+    """
+    Get user profile by ID.
+
+    Args:
+        user_id: User UUID
+
+    Returns:
+        User profile
+    """
+    user = db.get_user(user_id)
+
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
 
     return UserProfileResponse(**user)
 
@@ -316,10 +742,204 @@ async def update_current_user_profile(
         raise HTTPException(status_code=500, detail=f"Failed to update profile: {str(e)}")
 
 
+@app.get("/api/users/me/voice-preferences", response_model=VoicePreferences, tags=["Users"])
+async def get_voice_preferences(
+    db: Database = Depends(get_database),
+    user_id_from_token: str = Depends(verify_token),
+):
+    """
+    Get current user's voice preferences.
+
+    Requires JWT authentication. User ID is extracted from the token.
+
+    Returns:
+        Voice preferences (voice, speech_speed, auto_play_responses, show_transcription, microphone_sensitivity)
+    """
+    try:
+        user_id = uuid.UUID(user_id_from_token)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid user_id from token")
+
+    # Auto-create user profile if doesn't exist
+    get_or_create_user(str(user_id))
+
+    try:
+        with db.get_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    SELECT voice_preferences
+                    FROM user_profiles
+                    WHERE user_id = %s
+                """, (str(user_id),))
+                result = cur.fetchone()
+
+                if not result or not result['voice_preferences']:
+                    # Return default preferences
+                    return VoicePreferences()
+
+                prefs = result['voice_preferences']
+                return VoicePreferences(
+                    voice=prefs.get('voice', 'alloy'),
+                    speech_speed=prefs.get('speech_speed', 1.0),
+                    auto_play_responses=prefs.get('auto_play_responses', True),
+                    show_transcription=prefs.get('show_transcription', True),
+                    microphone_sensitivity=prefs.get('microphone_sensitivity', 0.5)
+                )
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to get voice preferences: {str(e)}")
+
+
+@app.put("/api/users/me/voice-preferences", response_model=VoicePreferences, tags=["Users"])
+async def update_voice_preferences(
+    request: UpdateVoicePreferencesRequest,
+    db: Database = Depends(get_database),
+    user_id_from_token: str = Depends(verify_token),
+):
+    """
+    Update current user's voice preferences.
+
+    Requires JWT authentication. User ID is extracted from the token.
+
+    Args:
+        request: Voice preferences update request
+
+    Returns:
+        Updated voice preferences
+    """
+    try:
+        user_id = uuid.UUID(user_id_from_token)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid user_id from token")
+
+    # Auto-create user profile if doesn't exist
+    get_or_create_user(str(user_id))
+
+    try:
+        with db.get_connection() as conn:
+            with conn.cursor() as cur:
+                # Get current preferences
+                cur.execute("""
+                    SELECT voice_preferences
+                    FROM user_profiles
+                    WHERE user_id = %s
+                """, (str(user_id),))
+                result = cur.fetchone()
+
+                # Start with defaults or current preferences
+                current_prefs = result['voice_preferences'] if result and result['voice_preferences'] else {}
+
+                # Update with new values (only if provided)
+                if request.voice is not None:
+                    current_prefs['voice'] = request.voice
+                if request.speech_speed is not None:
+                    current_prefs['speech_speed'] = request.speech_speed
+                if request.auto_play_responses is not None:
+                    current_prefs['auto_play_responses'] = request.auto_play_responses
+                if request.show_transcription is not None:
+                    current_prefs['show_transcription'] = request.show_transcription
+                if request.microphone_sensitivity is not None:
+                    current_prefs['microphone_sensitivity'] = request.microphone_sensitivity
+
+                # Update database
+                import json
+                cur.execute("""
+                    UPDATE user_profiles
+                    SET voice_preferences = %s, updated_at = NOW()
+                    WHERE user_id = %s
+                """, (json.dumps(current_prefs), str(user_id)))
+                conn.commit()
+
+                # Return updated preferences
+                return VoicePreferences(
+                    voice=current_prefs.get('voice', 'alloy'),
+                    speech_speed=current_prefs.get('speech_speed', 1.0),
+                    auto_play_responses=current_prefs.get('auto_play_responses', True),
+                    show_transcription=current_prefs.get('show_transcription', True),
+                    microphone_sensitivity=current_prefs.get('microphone_sensitivity', 0.5)
+                )
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to update voice preferences: {str(e)}")
+
+
 # Tutor Endpoints
 
 
 from fastapi import Body
+
+def build_rich_tutor_context(
+    db: Database,
+    user_id: uuid.UUID,
+    user: dict,
+    scenario_id: Optional[str] = None,
+    session_id: Optional[uuid.UUID] = None,
+    context_str: Optional[str] = None,
+    turn_number: int = 1,
+) -> dict:
+    """
+    Build rich context for the AI tutor including user profile, errors, and skills.
+
+    This context helps the AI personalize feedback based on:
+    - User's level, goals, interests, native language
+    - Recent error patterns (to address recurring mistakes)
+    - Weak skills (to focus corrections)
+    """
+    # Base context
+    context = {
+        "source": "api",
+        "mode": "scenario" if scenario_id else "text",
+        "scenario_id": scenario_id,
+        "session_id": str(session_id) if session_id else None,
+        "user_id": str(user_id),
+        "turn_number": turn_number,
+        "raw_context": context_str,
+    }
+
+    # User profile data
+    context["level"] = user.get('level', 'A1')
+    context["native_language"] = user.get('native_language')
+    context["goals"] = user.get('goals', [])
+    context["interests"] = user.get('interests', [])
+
+    # Recent errors (last 10) - helps identify recurring patterns
+    try:
+        recent_errors = db.get_user_errors(user_id, limit=10)
+        if recent_errors:
+            # Summarize error patterns
+            error_summary = []
+            error_types = {}
+            for err in recent_errors:
+                err_type = err.get('error_type', 'unknown')
+                error_types[err_type] = error_types.get(err_type, 0) + 1
+                if len(error_summary) < 5:  # Keep top 5 examples
+                    error_summary.append({
+                        "type": err_type,
+                        "mistake": err.get('user_sentence', '')[:100],
+                        "correction": err.get('corrected_sentence', '')[:100],
+                    })
+            context["recent_error_patterns"] = error_types
+            context["recent_error_examples"] = error_summary
+    except Exception:
+        pass  # Don't fail if error history unavailable
+
+    # Weak skills (top 3) - focus corrections on problem areas
+    try:
+        weak_skills = db.get_weakest_skills(user_id, limit=3)
+        if weak_skills:
+            context["weak_skills"] = [
+                {"skill": s.get('skill_key'), "mastery": s.get('mastery_score', 0)}
+                for s in weak_skills
+            ]
+    except Exception:
+        pass  # Don't fail if skill data unavailable
+
+    return context
+
 
 @app.post("/api/tutor/text", tags=["Tutor"])
 async def tutor_text(
@@ -350,6 +970,7 @@ async def tutor_text(
 
         scenario_id = payload.get("scenario_id")
         context_str = payload.get("context")
+        turn_number = payload.get("turn_number", 1)
         session_id_raw = payload.get("session_id")
         session_id: Optional[uuid.UUID] = None
         if session_id_raw:
@@ -374,22 +995,22 @@ async def tutor_text(
         else:
             session = {"session_id": session_id}
 
-        # Get user level for tutor mode (beginner vs advanced)
-        user_level = user.get('level', 'A1')
+        # Build rich context with user profile, errors, and skills
+        rich_context = build_rich_tutor_context(
+            db=db,
+            user_id=user_id,
+            user=user,
+            scenario_id=scenario_id,
+            session_id=session_id,
+            context_str=context_str,
+            turn_number=turn_number,
+        )
 
-        # Run tutor
-        tutor = TutorAgent()
+        # Run tutor with enriched context and conversation memory
+        tutor = TutorAgent(user_id=str(user_id), db=db)
         tutor_response: TutorResponse = tutor.process_user_input(
             text,
-            context={
-                "source": "api",
-                "mode": "text",
-                "scenario_id": scenario_id,
-                "session_id": str(session_id),
-                "user_id": str(user_id),
-                "level": user_level,
-                "raw_context": context_str,
-            },
+            context=rich_context,
         )
 
         # Log errors + create SRS cards
@@ -404,6 +1025,24 @@ async def tutor_text(
                 source_type="text_tutor",
             )
             db.create_card_from_error(error_id=err_record["error_id"])
+
+        # Save conversation turn to memory
+        try:
+            db.save_conversation_turn(
+                user_id=user_id,
+                session_id=session_id,
+                turn_number=turn_number,
+                user_message=text,
+                tutor_response=tutor_response.message,
+                context_type=scenario_id or "free_chat",
+                context_id=scenario_id,
+                metadata={
+                    "error_count": len(tutor_response.errors),
+                    "has_micro_task": tutor_response.micro_task is not None
+                }
+            )
+        except Exception as e:
+            print(f"Warning: Failed to save conversation turn: {e}")
 
         # Build response
         return {
@@ -489,6 +1128,25 @@ async def tutor_voice(
             )
             db.create_card_from_error(error_id=err_record["error_id"])
 
+        # Save conversation turn to memory
+        try:
+            db.save_conversation_turn(
+                user_id=user_id,
+                session_id=session_id,
+                turn_number=1,  # Voice sessions are typically one turn at a time
+                user_message=result.recognized_text,
+                tutor_response=result.tutor_response.message,
+                context_type="voice_tutor",
+                context_id=None,
+                metadata={
+                    "error_count": len(result.tutor_response.errors),
+                    "has_audio": True,
+                    "filename": filename
+                }
+            )
+        except Exception as e:
+            print(f"Warning: Failed to save voice conversation turn: {e}")
+
         # Read TTS audio file and encode as base64
         import base64
         audio_base64 = None
@@ -515,6 +1173,138 @@ async def tutor_voice(
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Voice tutor error: {str(e)}")
+
+
+@app.post("/api/tutor/voice/stream", tags=["Tutor"])
+async def tutor_voice_streaming(
+    file: UploadFile,
+    mode: Optional[str] = "chunk",  # "chunk" or "sentence"
+    db: Database = Depends(get_database),
+    user_id_from_token: str = Depends(verify_token),
+):
+    """
+    Process voice input with streaming TTS response (SSE format).
+
+    Requires JWT authentication. User ID is extracted from the token.
+
+    Accepts multipart/form-data with audio file.
+
+    Query params:
+    - mode: "chunk" (default) for continuous streaming, "sentence" for sentence-by-sentence
+
+    Pipeline:
+    1. ASR: Transcribe audio to text (OpenAI Whisper)
+    2. Tutor: Process text through TutorAgent
+    3. TTS: Stream audio response in chunks
+
+    Returns:
+        Server-Sent Events (SSE) stream with the following event types:
+        - transcript: User's transcribed speech
+        - tutor_response: Tutor's text response with errors
+        - audio_start: Signal that audio streaming is beginning
+        - audio_chunk: Base64-encoded audio data chunks
+        - audio_end: Signal that audio streaming is complete
+        - sentence_start/end: (sentence mode only) Sentence boundaries
+        - complete: Final event with metadata
+
+    Benefits:
+    - Lower perceived latency (audio starts playing sooner)
+    - Progressive feedback to user
+    - Better UX with incremental updates
+    """
+    try:
+        user_id = uuid.UUID(user_id_from_token)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid user_id from token")
+
+    # Auto-create user profile if doesn't exist
+    user = get_or_create_user(str(user_id))
+    user_level = user.get('level', 'A1')
+
+    # Create DB session
+    session = db.create_session(
+        user_id=user_id,
+        session_type="voice_tutor_streaming",
+        metadata={"source": "api", "mode": "voice", "streaming": True}
+    )
+    session_id = session["session_id"]
+
+    async def event_generator():
+        """Generate SSE events for streaming response."""
+        try:
+            # Read audio bytes from uploaded file
+            audio_bytes = await file.read()
+            filename = file.filename or "audio.webm"
+
+            # Create voice session
+            from app.voice_session import VoiceSession
+            voice_session = VoiceSession(
+                user_level=user_level,
+                mode="free_chat",
+                context={"session_id": str(session_id), "user_id": str(user_id), "filename": filename}
+            )
+
+            # Choose streaming mode
+            if mode == "sentence":
+                stream_func = voice_session.handle_audio_input_streaming_sentences
+            else:
+                stream_func = voice_session.handle_audio_input_streaming
+
+            # Track tutor response for error logging
+            tutor_response_data = None
+
+            # Stream events
+            for event in stream_func(audio_bytes):
+                event_type = event["type"]
+                event_data = event["data"]
+
+                # Store tutor response for later error logging
+                if event_type == "tutor_response":
+                    tutor_response_data = event_data
+
+                # For audio chunks, encode as base64
+                if event_type == "audio_chunk":
+                    chunk = event_data["chunk"]
+                    event_data = {
+                        "chunk": base64.b64encode(chunk).decode('utf-8')
+                    }
+
+                # Format as SSE
+                yield f"event: {event_type}\n"
+                yield f"data: {json.dumps(event_data)}\n\n"
+
+            # Log errors after streaming completes
+            if tutor_response_data and tutor_response_data.get("errors"):
+                for err in tutor_response_data["errors"]:
+                    try:
+                        err_record = db.log_error(
+                            user_id=user_id,
+                            error_type=err["type"],
+                            user_sentence=err["user_sentence"],
+                            corrected_sentence=err["corrected_sentence"],
+                            explanation=err["explanation"],
+                            session_id=session_id,
+                            source_type="voice_tutor_streaming",
+                        )
+                        db.create_card_from_error(error_id=err_record["error_id"])
+                    except Exception as e:
+                        print(f"Warning: Failed to log error: {e}")
+
+        except Exception as e:
+            # Send error event
+            error_data = {"error": str(e)}
+            yield f"event: error\n"
+            yield f"data: {json.dumps(error_data)}\n\n"
+
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",  # Disable nginx buffering
+        }
+    )
 
 
 # SRS Endpoints
@@ -721,6 +1511,311 @@ async def get_weakest_skills(
             status_code=500,
             detail=f"Failed to get weakest skills: {str(e)}"
         )
+
+
+# Skills Mastery Engine Endpoints
+
+@app.get("/api/skills/definitions", tags=["Skills"])
+async def get_skill_definitions(
+    domain: Optional[str] = None,
+    level: Optional[str] = None,
+    db: Database = Depends(get_database),
+):
+    """
+    Get all skill definitions (no auth required).
+    Optional filters: domain (grammar, vocabulary, listening, pronunciation), level (A1, A2, B1)
+    """
+    try:
+        with db.get_connection() as conn:
+            with conn.cursor() as cur:
+                query = """
+                    SELECT skill_key, domain, category, name_en, description_en, cefr_level, difficulty
+                    FROM skill_definitions
+                    WHERE is_active = TRUE
+                """
+                params = []
+                if domain:
+                    query += " AND domain = %s"
+                    params.append(domain)
+                if level:
+                    query += " AND cefr_level = %s"
+                    params.append(level)
+                query += " ORDER BY domain, category, difficulty"
+
+                cur.execute(query, params)
+                rows = cur.fetchall()
+
+                skills = []
+                for row in rows:
+                    # Handle both dict and tuple rows
+                    if isinstance(row, dict):
+                        skills.append({
+                            "skill_key": row['skill_key'],
+                            "domain": row['domain'],
+                            "category": row['category'],
+                            "name": row['name_en'],
+                            "description": row['description_en'],
+                            "level": row['cefr_level'],
+                            "difficulty": row['difficulty']
+                        })
+                    else:
+                        skills.append({
+                            "skill_key": row[0],
+                            "domain": row[1],
+                            "category": row[2],
+                            "name": row[3],
+                            "description": row[4],
+                            "level": row[5],
+                            "difficulty": row[6]
+                        })
+
+                return {"skills": skills, "count": len(skills)}
+
+    except Exception as e:
+        import traceback
+        raise HTTPException(status_code=500, detail=f"Failed to get skill definitions: {str(e)}\n{traceback.format_exc()}")
+
+
+@app.get("/api/skills/mastery", tags=["Skills"])
+async def get_skill_mastery(
+    db: Database = Depends(get_database),
+    user_id_from_token: str = Depends(verify_token),
+):
+    """
+    Get user's mastery for all skills (BKT p_learned values).
+    """
+    try:
+        user_id = uuid.UUID(user_id_from_token)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid user_id from token")
+
+    try:
+        with db.get_connection() as conn:
+            with conn.cursor() as cur:
+                # Get overview
+                cur.execute("SELECT * FROM get_skill_mastery_overview(%s)", (str(user_id),))
+                overview = cur.fetchone()
+
+                # Get all skills with user mastery
+                cur.execute("""
+                    SELECT
+                        sd.skill_key,
+                        sd.domain,
+                        sd.name_en,
+                        sd.cefr_level,
+                        COALESCE(sgn.p_learned, 0.1) as p_learned,
+                        COALESCE(sgn.practice_count, 0) as practice_count,
+                        sgn.last_practiced
+                    FROM skill_definitions sd
+                    LEFT JOIN skill_graph_nodes sgn
+                        ON sd.skill_key = sgn.skill_key AND sgn.user_id = %s
+                    WHERE sd.is_active = TRUE
+                    ORDER BY sd.domain, sd.category
+                """, (str(user_id),))
+                rows = cur.fetchall()
+
+                skills = []
+                for row in rows:
+                    if isinstance(row, dict):
+                        last_practiced = row.get('last_practiced')
+                        skills.append({
+                            "skill_key": row['skill_key'],
+                            "domain": row['domain'],
+                            "name": row['name_en'],
+                            "level": row['cefr_level'],
+                            "p_learned": row['p_learned'],
+                            "practice_count": row['practice_count'],
+                            "last_practiced": last_practiced.isoformat() if last_practiced else None
+                        })
+                    else:
+                        skills.append({
+                            "skill_key": row[0],
+                            "domain": row[1],
+                            "name": row[2],
+                            "level": row[3],
+                            "p_learned": row[4],
+                            "practice_count": row[5],
+                            "last_practiced": row[6].isoformat() if row[6] else None
+                        })
+
+                # Handle overview dict/tuple
+                if isinstance(overview, dict):
+                    overview_data = {
+                        "total_skills": overview.get('total_skills', 0),
+                        "skills_practiced": overview.get('skills_practiced', 0),
+                        "mastered": overview.get('mastered_count', 0),
+                        "in_progress": overview.get('in_progress_count', 0),
+                        "struggling": overview.get('struggling_count', 0),
+                        "avg_mastery": overview.get('avg_mastery', 0.1)
+                    }
+                else:
+                    overview_data = {
+                        "total_skills": overview[0] if overview else 0,
+                        "skills_practiced": overview[1] if overview else 0,
+                        "mastered": overview[2] if overview else 0,
+                        "in_progress": overview[3] if overview else 0,
+                        "struggling": overview[4] if overview else 0,
+                        "avg_mastery": overview[5] if overview else 0.1
+                    }
+
+                return {
+                    "overview": overview_data,
+                    "skills": skills
+                }
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to get skill mastery: {str(e)}")
+
+
+@app.get("/api/skills/bands", tags=["Skills"])
+async def get_skill_bands(
+    db: Database = Depends(get_database),
+    user_id_from_token: str = Depends(verify_token),
+):
+    """
+    Get user's average mastery per CEFR band (A1, A2, B1).
+
+    Returns avg_mastery (0-1) for each band based on seeded P(L) values.
+    These values reflect the user's placement and subsequent practice.
+    """
+    try:
+        user_id = uuid.UUID(user_id_from_token)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid user_id from token")
+
+    try:
+        with db.get_connection() as conn:
+            with conn.cursor() as cur:
+                # Get avg P(L) per CEFR band
+                cur.execute("""
+                    SELECT
+                        sd.cefr_level,
+                        COALESCE(AVG(sgn.p_learned), 0.1) as avg_mastery
+                    FROM skill_definitions sd
+                    LEFT JOIN skill_graph_nodes sgn
+                        ON sd.skill_key = sgn.skill_key AND sgn.user_id = %s
+                    WHERE sd.is_active = TRUE
+                      AND sd.cefr_level IN ('A1', 'A2', 'B1')
+                    GROUP BY sd.cefr_level
+                    ORDER BY sd.cefr_level
+                """, (str(user_id),))
+                rows = cur.fetchall()
+
+                bands = {}
+                for row in rows:
+                    if isinstance(row, dict):
+                        level = row['cefr_level']
+                        avg_mastery = row['avg_mastery']
+                    else:
+                        level = row[0]
+                        avg_mastery = row[1]
+
+                    bands[level] = {
+                        "avg_mastery": round(float(avg_mastery), 3) if avg_mastery else 0.1
+                    }
+
+                # Ensure all levels are present
+                for level in ["A1", "A2", "B1"]:
+                    if level not in bands:
+                        bands[level] = {"avg_mastery": 0.1}
+
+                return bands
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to get skill bands: {str(e)}")
+
+
+@app.get("/api/skills/recommend", tags=["Skills"])
+async def get_recommended_skills(
+    count: int = 3,
+    db: Database = Depends(get_database),
+    user_id_from_token: str = Depends(verify_token),
+):
+    """
+    Get recommended skills to practice (lowest mastery first).
+    """
+    try:
+        user_id = uuid.UUID(user_id_from_token)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid user_id from token")
+
+    try:
+        with db.get_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT * FROM get_recommended_skills(%s, %s)", (str(user_id), count))
+                rows = cur.fetchall()
+
+                skills = []
+                for row in rows:
+                    if isinstance(row, dict):
+                        skills.append({
+                            "skill_key": row['skill_key'],
+                            "name": row['name_en'],
+                            "domain": row['domain'],
+                            "level": row['cefr_level'],
+                            "p_learned": row['p_learned'],
+                            "practice_count": row['practice_count']
+                        })
+                    else:
+                        skills.append({
+                            "skill_key": row[0],
+                            "name": row[1],
+                            "domain": row[2],
+                            "level": row[3],
+                            "p_learned": row[4],
+                            "practice_count": row[5]
+                        })
+
+                return {"recommended": skills}
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to get recommendations: {str(e)}")
+
+
+class SkillPracticeRequest(BaseModel):
+    """Request for skill practice submission"""
+    skill_key: str
+    correct: bool
+
+
+@app.post("/api/skills/practice", tags=["Skills"])
+async def submit_skill_practice(
+    request: SkillPracticeRequest,
+    db: Database = Depends(get_database),
+    user_id_from_token: str = Depends(verify_token),
+):
+    """
+    Submit skill practice result and update BKT mastery.
+    """
+    try:
+        user_id = uuid.UUID(user_id_from_token)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid user_id from token")
+
+    try:
+        with db.get_connection() as conn:
+            with conn.cursor() as cur:
+                # Update BKT mastery
+                cur.execute(
+                    "SELECT update_skill_bkt(%s, %s, %s)",
+                    (str(user_id), request.skill_key, request.correct)
+                )
+                result = cur.fetchone()
+                if isinstance(result, dict):
+                    new_p_learned = result.get('update_skill_bkt', 0.1)
+                else:
+                    new_p_learned = result[0] if result else 0.1
+                conn.commit()
+
+                return {
+                    "skill_key": request.skill_key,
+                    "correct": request.correct,
+                    "new_p_learned": new_p_learned,
+                    "mastery_percent": round(new_p_learned * 100, 1)
+                }
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to update skill: {str(e)}")
 
 
 # ============================================================================
@@ -1532,6 +2627,2642 @@ async def submit_placement_test(
         "weaknesses": result.weaknesses,
         "recommendation": result.recommendation,
     }
+
+
+# ============================================================================
+# Exercise Endpoints
+# ============================================================================
+
+@app.get("/api/exercises/session", tags=["Exercises"])
+async def get_exercise_session(
+    count: int = 5,
+    level: Optional[str] = None,
+    skill: Optional[str] = None,
+    exercise_type: Optional[str] = None,
+    user_id_from_token: str = Depends(verify_token),
+):
+    """
+    Get a practice session with exercises.
+
+    Args:
+        count: Number of exercises (default 5)
+        level: Filter by level (A1, A2, B1, B2, C1, C2)
+        skill: Filter by skill type (grammar, vocabulary)
+        exercise_type: Filter by type (multiple_choice, fill_blank, sentence_correction)
+
+    Returns:
+        List of exercises for the session
+    """
+    from app.exercises import exercise_manager, SkillType, ExerciseType
+
+    # Convert string params to enums
+    skill_enum = None
+    if skill:
+        try:
+            skill_enum = SkillType(skill.lower())
+        except ValueError:
+            pass
+
+    type_enum = None
+    if exercise_type:
+        try:
+            type_enum = ExerciseType(exercise_type.lower())
+        except ValueError:
+            pass
+
+    # Get user level if not specified
+    if not level:
+        try:
+            user_id = uuid.UUID(user_id_from_token)
+            user = get_or_create_user(str(user_id))
+            level = user.get('level', 'B1')
+        except:
+            level = 'B1'
+
+    exercises = exercise_manager.get_practice_session(
+        count=count,
+        level=level,
+        skill=skill_enum,
+        exercise_type=type_enum,
+    )
+
+    return {
+        "exercises": [
+            {
+                "id": ex.exercise_id,
+                "type": ex.exercise_type.value,
+                "level": ex.level,
+                "skill": ex.skill.value,
+                "question": ex.question,
+                "options": ex.options,
+                "hint": ex.hint,
+                # Don't send correct answer to client
+            }
+            for ex in exercises
+        ],
+        "count": len(exercises),
+    }
+
+
+@app.post("/api/exercises/submit", tags=["Exercises"])
+async def submit_exercise_answer(
+    payload: dict = Body(...),
+    db: Database = Depends(get_database),
+    user_id_from_token: str = Depends(verify_token),
+):
+    """
+    Submit an answer for an exercise.
+
+    Payload:
+    {
+        "exercise_id": "mc-gram-b1-001",
+        "user_answer": "were"
+    }
+
+    Returns:
+        is_correct, correct_answer, explanation, xp_earned
+    """
+    from app.exercises import exercise_manager
+
+    exercise_id = payload.get("exercise_id")
+    user_answer = payload.get("user_answer")
+
+    if not exercise_id:
+        raise HTTPException(status_code=400, detail="Missing exercise_id")
+    if not user_answer and user_answer != 0:  # Allow 0 as answer
+        raise HTTPException(status_code=400, detail="Missing user_answer")
+
+    try:
+        user_id = uuid.UUID(user_id_from_token)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid user_id from token")
+
+    try:
+        result = exercise_manager.check_answer(exercise_id, str(user_answer))
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+
+    # Calculate XP (only if correct and not already earned for this exercise recently)
+    xp_earned = 0
+    total_xp = None
+    if result["is_correct"] and _can_earn_xp(user_id_from_token, exercise_id):
+        xp_earned = 10
+        try:
+            total_xp = add_user_xp(user_id_from_token, xp_earned)
+            _mark_xp_earned(user_id_from_token, exercise_id)
+        except Exception as e:
+            print(f"Warning: Failed to add XP: {e}")
+
+    # Log the exercise attempt
+    try:
+        session = db.create_session(
+            user_id=user_id,
+            session_type="exercise",
+            metadata={
+                "exercise_id": exercise_id,
+                "user_answer": str(user_answer),
+                "is_correct": result["is_correct"],
+            }
+        )
+
+        # If incorrect, log as error for SRS
+        if not result["is_correct"]:
+            exercise = exercise_manager.get_exercise(exercise_id)
+            if exercise:
+                err_record = db.log_error(
+                    user_id=user_id,
+                    error_type=exercise.skill.value,
+                    user_sentence=str(user_answer),
+                    corrected_sentence=result["correct_answer"],
+                    explanation=result["explanation"],
+                    session_id=session["session_id"],
+                    source_type="exercise",
+                )
+                db.create_card_from_error(error_id=err_record["error_id"])
+    except Exception as e:
+        # Log but don't fail the request
+        print(f"Warning: Failed to log exercise: {e}")
+
+    return {
+        "is_correct": result["is_correct"],
+        "correct_answer": result["correct_answer"],
+        "explanation": result["explanation"],
+        "xp_earned": xp_earned,
+        "total_xp": total_xp,  # New total XP (None if not updated)
+    }
+
+
+@app.get("/api/exercises/{exercise_id}", tags=["Exercises"])
+async def get_exercise(
+    exercise_id: str,
+    user_id_from_token: str = Depends(verify_token),
+):
+    """
+    Get a specific exercise by ID.
+
+    Returns the exercise without the correct answer.
+    """
+    from app.exercises import exercise_manager
+
+    exercise = exercise_manager.get_exercise(exercise_id)
+
+    if not exercise:
+        raise HTTPException(status_code=404, detail=f"Exercise '{exercise_id}' not found")
+
+    return {
+        "id": exercise.exercise_id,
+        "type": exercise.exercise_type.value,
+        "level": exercise.level,
+        "skill": exercise.skill.value,
+        "question": exercise.question,
+        "options": exercise.options,
+        "hint": exercise.hint,
+    }
+
+
+# ============================================================================
+# Streaks Endpoints
+# ============================================================================
+
+@app.get("/api/streaks/current", tags=["Streaks"])
+async def get_current_streak(
+    db: Database = Depends(get_database),
+    user_id_from_token: str = Depends(verify_token),
+):
+    """
+    Get current user's streak information.
+
+    Requires JWT authentication. User ID is extracted from the token.
+
+    Returns:
+    - current_streak: Current consecutive days streak
+    - longest_streak: Longest streak ever achieved
+    - last_active_date: Date of last activity
+    """
+    try:
+        user_id = uuid.UUID(user_id_from_token)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid user_id from token")
+
+    try:
+        streak_data = db.get_user_streak(user_id)
+
+        if streak_data is None:
+            return {
+                "current_streak": 0,
+                "longest_streak": 0,
+                "last_active_date": None
+            }
+
+        return streak_data
+
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to get streak data: {str(e)}"
+        )
+
+
+@app.post("/api/streaks/record-activity", tags=["Streaks"])
+async def record_activity(
+    db: Database = Depends(get_database),
+    user_id_from_token: str = Depends(verify_token),
+):
+    """
+    Record user activity and update streak.
+
+    Call this when the user completes an exercise, lesson, or any meaningful activity.
+    The streak logic handles:
+    - First activity: creates streak record with 1 day
+    - Already logged today: returns current streak (no change)
+    - Continuing from yesterday: increments streak
+    - Streak broken (gap > 1 day): resets to 1
+
+    Returns:
+    - current_streak: Current consecutive days streak
+    - longest_streak: Longest streak ever achieved
+    - last_active_date: Date of last activity
+    - total_days_active: Total number of active days
+    - freeze_days_available: Freeze days remaining
+    """
+    try:
+        user_id = uuid.UUID(user_id_from_token)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid user_id from token")
+
+    try:
+        streak_data = db.record_activity(user_id)
+        return streak_data
+
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to record activity: {str(e)}"
+        )
+
+
+# ============================================================================
+# Daily Goals Endpoints
+# ============================================================================
+
+@app.get("/api/goals/today", tags=["Goals"])
+async def get_today_goal(
+    db: Database = Depends(get_database),
+    user_id_from_token: str = Depends(verify_token),
+):
+    """
+    Get today's daily goal for the authenticated user.
+
+    Creates a goal with default targets if it doesn't exist.
+
+    Returns:
+    - goal_id: Goal UUID
+    - user_id: User UUID
+    - goal_date: Date of the goal
+    - target_study_minutes: Target study time in minutes
+    - target_lessons: Target number of lessons
+    - target_reviews: Target number of reviews
+    - target_drills: Target number of drills
+    - actual_study_minutes: Actual study time completed
+    - actual_lessons: Actual lessons completed
+    - actual_reviews: Actual reviews completed
+    - actual_drills: Actual drills completed
+    - completed: Whether all goals are completed
+    - completion_percentage: Overall completion percentage (0-100)
+    """
+    try:
+        user_id = uuid.UUID(user_id_from_token)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid user_id from token")
+
+    try:
+        # Try to get existing goal
+        goal = db.get_daily_goal(user_id)
+
+        # If no goal exists, create one with default targets
+        if not goal:
+            goal = db.create_or_update_daily_goal(
+                user_id=user_id,
+                target_study_minutes=30,
+                target_lessons=1,
+                target_reviews=10,
+                target_drills=2
+            )
+
+        return goal
+
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to get daily goal: {str(e)}"
+        )
+
+
+@app.post("/api/goals/today", tags=["Goals"])
+async def update_today_goal(
+    targets: dict = Body(...),
+    db: Database = Depends(get_database),
+    user_id_from_token: str = Depends(verify_token),
+):
+    """
+    Update today's goal targets for the authenticated user.
+
+    Request body:
+    {
+        "target_study_minutes": 45,
+        "target_lessons": 2,
+        "target_reviews": 15,
+        "target_drills": 3
+    }
+
+    All fields are optional - only provided fields will be updated.
+
+    Returns the updated daily goal.
+    """
+    try:
+        user_id = uuid.UUID(user_id_from_token)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid user_id from token")
+
+    try:
+        # Extract targets from request
+        target_study_minutes = targets.get("target_study_minutes")
+        target_lessons = targets.get("target_lessons")
+        target_reviews = targets.get("target_reviews")
+        target_drills = targets.get("target_drills")
+
+        # Update or create goal with new targets
+        goal = db.create_or_update_daily_goal(
+            user_id=user_id,
+            target_study_minutes=target_study_minutes,
+            target_lessons=target_lessons,
+            target_reviews=target_reviews,
+            target_drills=target_drills
+        )
+
+        return goal
+
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to update daily goal: {str(e)}"
+        )
+
+
+@app.post("/api/goals/today/progress", tags=["Goals"])
+async def update_goal_progress(
+    progress: dict = Body(...),
+    db: Database = Depends(get_database),
+    user_id_from_token: str = Depends(verify_token),
+):
+    """
+    Increment today's goal progress for the authenticated user.
+
+    Request body:
+    {
+        "study_minutes": 15,
+        "lessons": 1,
+        "reviews": 5,
+        "drills": 1
+    }
+
+    All fields are optional and default to 0.
+    This endpoint increments the current progress values.
+
+    Returns the updated daily goal with new progress.
+    """
+    try:
+        user_id = uuid.UUID(user_id_from_token)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid user_id from token")
+
+    try:
+        # Extract progress increments from request
+        study_minutes = progress.get("study_minutes", 0)
+        lessons = progress.get("lessons", 0)
+        reviews = progress.get("reviews", 0)
+        drills = progress.get("drills", 0)
+
+        # Increment progress
+        goal = db.increment_daily_goal_progress(
+            user_id=user_id,
+            study_minutes=study_minutes,
+            lessons=lessons,
+            reviews=reviews,
+            drills=drills
+        )
+
+        return goal
+
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to update goal progress: {str(e)}"
+        )
+
+
+# ============================================================================
+# Leaderboard Endpoints
+# ============================================================================
+
+@app.get("/api/leaderboard/weekly", tags=["Leaderboard"])
+async def get_weekly_leaderboard(
+    limit: int = 50,
+    db: Database = Depends(get_database),
+    user_id_from_token: str = Depends(verify_token),
+):
+    """
+    Get weekly leaderboard (top users by XP gained this week).
+
+    Returns top 50 users plus authenticated user's rank if not in top 50.
+    XP is calculated based on completed sessions (10 XP per session).
+
+    Returns:
+        - leaderboard: Array of top users with rank, name, xp, level
+        - current_user: Current user's rank and stats (if authenticated)
+    """
+    try:
+        user_id = uuid.UUID(user_id_from_token)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid user_id from token")
+
+    try:
+        result = db.get_weekly_leaderboard(limit=limit, current_user_id=user_id)
+        return result
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to get weekly leaderboard: {str(e)}"
+        )
+
+
+@app.get("/api/leaderboard/monthly", tags=["Leaderboard"])
+async def get_monthly_leaderboard(
+    limit: int = 50,
+    db: Database = Depends(get_database),
+    user_id_from_token: str = Depends(verify_token),
+):
+    """
+    Get monthly leaderboard (top users by XP gained this month).
+
+    Returns top 50 users plus authenticated user's rank if not in top 50.
+    XP is calculated based on completed sessions (10 XP per session).
+
+    Returns:
+        - leaderboard: Array of top users with rank, name, xp, level
+        - current_user: Current user's rank and stats (if authenticated)
+    """
+    try:
+        user_id = uuid.UUID(user_id_from_token)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid user_id from token")
+
+    try:
+        result = db.get_monthly_leaderboard(limit=limit, current_user_id=user_id)
+        return result
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to get monthly leaderboard: {str(e)}"
+        )
+
+
+@app.get("/api/leaderboard/alltime", tags=["Leaderboard"])
+async def get_alltime_leaderboard(
+    limit: int = 50,
+    db: Database = Depends(get_database),
+    user_id_from_token: str = Depends(verify_token),
+):
+    """
+    Get all-time leaderboard (top users by total XP).
+
+    Returns top 50 users plus authenticated user's rank if not in top 50.
+    XP is calculated based on all completed sessions (10 XP per session).
+
+    Returns:
+        - leaderboard: Array of top users with rank, name, total_xp, level
+        - current_user: Current user's rank and stats (if authenticated)
+    """
+    try:
+        user_id = uuid.UUID(user_id_from_token)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid user_id from token")
+
+    try:
+        result = db.get_alltime_leaderboard(limit=limit, current_user_id=user_id)
+        return result
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to get all-time leaderboard: {str(e)}"
+        )
+
+
+@app.get("/api/leaderboard/streaks", tags=["Leaderboard"])
+async def get_streak_leaderboard(
+    limit: int = 50,
+    db: Database = Depends(get_database),
+    user_id_from_token: str = Depends(verify_token),
+):
+    """
+    Get streak leaderboard (top users by current streak days).
+
+    Returns top 50 users plus authenticated user's rank if not in top 50.
+
+    Returns:
+        - leaderboard: Array of top users with rank, name, current_streak, level
+        - current_user: Current user's rank and stats (if authenticated)
+    """
+    try:
+        user_id = uuid.UUID(user_id_from_token)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid user_id from token")
+
+    try:
+        result = db.get_streak_leaderboard(limit=limit, current_user_id=user_id)
+        return result
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to get streak leaderboard: {str(e)}"
+        )
+
+
+# ============================================================================
+# Notifications Endpoints
+# ============================================================================
+
+@app.get("/api/notifications", tags=["Notifications"])
+async def get_notifications(
+    limit: int = 20,
+    offset: int = 0,
+    unread_only: bool = False,
+    db: Database = Depends(get_database),
+    user_id_from_token: str = Depends(verify_token),
+):
+    """
+    Get user's notifications (paginated, unread first).
+
+    Query params:
+    - limit: Maximum number of notifications to return (default 20)
+    - offset: Number of notifications to skip (default 0)
+    - unread_only: If true, only return unread notifications (default false)
+
+    Returns:
+    - notifications: List of notification objects
+    - count: Total number of notifications returned
+    - has_more: Whether there are more notifications to load
+    """
+    try:
+        user_id = uuid.UUID(user_id_from_token)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid user_id from token")
+
+    try:
+        notifications = db.get_notifications(
+            user_id=user_id,
+            limit=limit + 1,  # Get one extra to check if there are more
+            offset=offset,
+            unread_only=unread_only
+        )
+
+        has_more = len(notifications) > limit
+        if has_more:
+            notifications = notifications[:limit]
+
+        # Convert datetime objects to ISO strings for JSON serialization
+        for notif in notifications:
+            if notif.get('created_at'):
+                notif['created_at'] = notif['created_at'].isoformat()
+            if notif.get('read_at'):
+                notif['read_at'] = notif['read_at'].isoformat()
+
+        return {
+            "notifications": notifications,
+            "count": len(notifications),
+            "has_more": has_more
+        }
+
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to get notifications: {str(e)}"
+        )
+
+
+@app.post("/api/notifications/{notification_id}/read", tags=["Notifications"])
+async def mark_notification_read(
+    notification_id: uuid.UUID,
+    db: Database = Depends(get_database),
+    user_id_from_token: str = Depends(verify_token),
+):
+    """
+    Mark a notification as read.
+
+    Args:
+        notification_id: UUID of the notification to mark as read
+
+    Returns:
+        Success confirmation
+    """
+    try:
+        user_id = uuid.UUID(user_id_from_token)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid user_id from token")
+
+    try:
+        # Verify the notification belongs to this user
+        notifications = db.get_notifications(user_id=user_id, limit=1000)
+        notification_ids = [n['notification_id'] for n in notifications]
+
+        if notification_id not in notification_ids:
+            raise HTTPException(status_code=404, detail="Notification not found")
+
+        success = db.mark_notification_read(notification_id)
+
+        if not success:
+            raise HTTPException(status_code=404, detail="Notification not found or already read")
+
+        return {
+            "status": "success",
+            "message": "Notification marked as read",
+            "notification_id": str(notification_id)
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to mark notification as read: {str(e)}"
+        )
+
+
+@app.post("/api/notifications/read-all", tags=["Notifications"])
+async def mark_all_notifications_read(
+    db: Database = Depends(get_database),
+    user_id_from_token: str = Depends(verify_token),
+):
+    """
+    Mark all notifications as read for the authenticated user.
+
+    Returns:
+        Number of notifications marked as read
+    """
+    try:
+        user_id = uuid.UUID(user_id_from_token)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid user_id from token")
+
+    try:
+        count = db.mark_all_notifications_read(user_id)
+
+        return {
+            "status": "success",
+            "message": f"Marked {count} notification(s) as read",
+            "count": count
+        }
+
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to mark all notifications as read: {str(e)}"
+        )
+
+
+@app.get("/api/notifications/unread-count", tags=["Notifications"])
+async def get_unread_notification_count(
+    db: Database = Depends(get_database),
+    user_id_from_token: str = Depends(verify_token),
+):
+    """
+    Get unread notification count for badge display.
+
+    Returns:
+        Unread notification count
+    """
+    try:
+        user_id = uuid.UUID(user_id_from_token)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid user_id from token")
+
+    try:
+        count = db.get_unread_notification_count(user_id)
+
+        return {
+            "unread_count": count
+        }
+
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to get unread count: {str(e)}"
+        )
+
+
+# ============================================================================
+# Conversation History Endpoints
+# ============================================================================
+
+@app.get("/api/tutor/history", tags=["Tutor"])
+async def get_conversation_history(
+    limit: int = 20,
+    context_type: Optional[str] = None,
+    context_id: Optional[str] = None,
+    db: Database = Depends(get_database),
+    user_id_from_token: str = Depends(verify_token),
+):
+    """
+    Get conversation history for the authenticated user.
+
+    Query params:
+    - limit: Maximum number of conversation turns to return (default 20)
+    - context_type: Filter by context type (scenario, lesson, free_chat, etc.)
+    - context_id: Filter by specific context ID (scenario_id, lesson_id, etc.)
+
+    Returns:
+    - conversations: List of conversation turns with user messages and tutor responses
+    - count: Total number of conversations returned
+    - summary: High-level summary of conversation patterns
+    """
+    try:
+        user_id = uuid.UUID(user_id_from_token)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid user_id from token")
+
+    try:
+        # Get filtered conversations if context specified
+        if context_type:
+            conversations = db.get_conversation_by_context(
+                user_id=user_id,
+                context_type=context_type,
+                context_id=context_id,
+                limit=limit
+            )
+        else:
+            # Get recent conversations
+            conversations = db.get_recent_conversations(user_id, limit=limit)
+
+        # Get conversation summary
+        summary = db.get_conversation_context(user_id, lookback_days=30)
+
+        # Convert datetime objects to ISO strings
+        for conv in conversations:
+            if conv.get('created_at'):
+                conv['created_at'] = conv['created_at'].isoformat()
+
+        return {
+            "conversations": conversations,
+            "count": len(conversations),
+            "summary": summary
+        }
+
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to get conversation history: {str(e)}"
+        )
+
+
+@app.delete("/api/tutor/history", tags=["Tutor"])
+async def clear_conversation_history(
+    before_date: Optional[str] = None,
+    db: Database = Depends(get_database),
+    user_id_from_token: str = Depends(verify_token),
+):
+    """
+    Clear conversation history for the authenticated user.
+
+    Query params:
+    - before_date: Optional ISO date string - only clear conversations before this date
+
+    Returns:
+    - deleted_count: Number of conversation turns deleted
+    - message: Success message
+    """
+    try:
+        user_id = uuid.UUID(user_id_from_token)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid user_id from token")
+
+    try:
+        # Parse before_date if provided
+        before_datetime = None
+        if before_date:
+            try:
+                from datetime import datetime as dt
+                before_datetime = dt.fromisoformat(before_date.replace('Z', '+00:00'))
+            except Exception:
+                raise HTTPException(status_code=400, detail="Invalid date format. Use ISO 8601 format.")
+
+        # Clear conversation history
+        deleted_count = db.clear_conversation_history(
+            user_id=user_id,
+            before_date=before_datetime
+        )
+
+        return {
+            "status": "success",
+            "message": f"Cleared {deleted_count} conversation turn(s)",
+            "deleted_count": deleted_count
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to clear conversation history: {str(e)}"
+        )
+
+
+@app.get("/api/tutor/memory-summary", tags=["Tutor"])
+async def get_memory_summary(
+    lookback_days: int = 30,
+    db: Database = Depends(get_database),
+    user_id_from_token: str = Depends(verify_token),
+):
+    """
+    Get a summary of the tutor's memory about the user.
+
+    Shows what the tutor "remembers" about past conversations,
+    including topics discussed, contexts used, and conversation patterns.
+
+    Query params:
+    - lookback_days: Number of days to look back (default 30)
+
+    Returns:
+    - total_conversations: Total number of conversation turns
+    - recent_topics: List of recent conversation contexts
+    - most_active_context: The most frequently used context type
+    - last_conversation_date: Date of last conversation
+    """
+    try:
+        user_id = uuid.UUID(user_id_from_token)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid user_id from token")
+
+    try:
+        summary = db.get_conversation_context(
+            user_id=user_id,
+            lookback_days=lookback_days
+        )
+
+        if not summary:
+            return {
+                "total_conversations": 0,
+                "recent_topics": [],
+                "most_active_context": None,
+                "last_conversation_date": None
+            }
+
+        # Extract data from summary
+        context_summary = summary.get('context_summary', {})
+
+        return {
+            "total_conversations": summary.get('total_conversations', 0),
+            "recent_topics": summary.get('recent_topics', []),
+            "most_active_context": context_summary.get('most_active_context'),
+            "last_conversation_date": context_summary.get('last_conversation_date')
+        }
+
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to get memory summary: {str(e)}"
+        )
+
+
+# Daily Challenges Endpoints
+
+
+@app.get("/api/challenges/today", tags=["Challenges"])
+async def get_today_challenge(
+    db: Database = Depends(get_database),
+    user_id_from_token: str = Depends(verify_token),
+):
+    """
+    Get today's daily challenge for the current user.
+
+    Requires JWT authentication. User ID is extracted from the token.
+
+    Returns:
+        Challenge definition with user's current progress
+    """
+    try:
+        user_id = uuid.UUID(user_id_from_token)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid user_id from token")
+
+    # Auto-create user profile if doesn't exist
+    get_or_create_user(str(user_id))
+
+    try:
+        # Get today's challenge definition
+        challenge = db.get_daily_challenge()
+
+        # Get user's progress on this challenge
+        progress_record = db.get_user_challenge_progress(user_id)
+
+        # Calculate time until next challenge
+        from datetime import datetime, timedelta
+        now = datetime.utcnow()
+        tomorrow = (now + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
+        seconds_until_reset = int((tomorrow - now).total_seconds())
+
+        return {
+            "challenge": challenge,
+            "progress": progress_record.get('progress', 0) if progress_record else 0,
+            "completed": progress_record.get('completed', False) if progress_record else False,
+            "completed_at": progress_record.get('completed_at') if progress_record else None,
+            "seconds_until_reset": seconds_until_reset,
+        }
+
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to get today's challenge: {str(e)}"
+        )
+
+
+@app.post("/api/challenges/complete", tags=["Challenges"])
+async def complete_challenge(
+    db: Database = Depends(get_database),
+    user_id_from_token: str = Depends(verify_token),
+):
+    """
+    Mark today's daily challenge as complete and award bonus XP.
+
+    Requires JWT authentication. User ID is extracted from the token.
+
+    Returns:
+        Completion status and reward info
+    """
+    try:
+        user_id = uuid.UUID(user_id_from_token)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid user_id from token")
+
+    # Auto-create user profile if doesn't exist
+    get_or_create_user(str(user_id))
+
+    try:
+        # Complete the challenge
+        result = db.complete_daily_challenge(user_id)
+
+        if result is None:
+            # Already completed
+            return {
+                "success": False,
+                "message": "Challenge already completed today",
+                "already_completed": True
+            }
+
+        # Get the challenge to find reward amount
+        challenge = db.get_daily_challenge()
+        reward_xp = challenge.get('reward_xp', 50)
+
+        # Award bonus XP (you might want to track this separately)
+        # For now, we'll just return the info
+        return {
+            "success": True,
+            "message": "Challenge completed! Bonus XP awarded!",
+            "reward_xp": reward_xp,
+            "completed_at": result.get('completed_at'),
+            "already_completed": False
+        }
+
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to complete challenge: {str(e)}"
+        )
+
+
+@app.get("/api/challenges/history", tags=["Challenges"])
+async def get_challenge_history(
+    limit: int = 30,
+    db: Database = Depends(get_database),
+    user_id_from_token: str = Depends(verify_token),
+):
+    """
+    Get user's challenge completion history.
+
+    Requires JWT authentication. User ID is extracted from the token.
+
+    Query params:
+        limit: Maximum number of records to return (default 30)
+
+    Returns:
+        List of past challenge completions
+    """
+    try:
+        user_id = uuid.UUID(user_id_from_token)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid user_id from token")
+
+    # Auto-create user profile if doesn't exist
+    get_or_create_user(str(user_id))
+
+    try:
+        # Get history
+        history = db.get_challenge_history(user_id, limit=limit)
+
+        # Get challenge streak
+        streak = db.get_challenge_streak(user_id)
+
+        # Enrich history with challenge definitions
+        enriched_history = []
+        for record in history:
+            challenge_date = record.get('challenge_date')
+            if challenge_date:
+                challenge_def = db.get_daily_challenge(challenge_date)
+                enriched_history.append({
+                    **record,
+                    "challenge_title": challenge_def.get('title'),
+                    "challenge_description": challenge_def.get('description'),
+                    "reward_xp": challenge_def.get('reward_xp'),
+                })
+            else:
+                enriched_history.append(record)
+
+        return {
+            "history": enriched_history,
+            "current_streak": streak,
+            "total_completed": sum(1 for h in history if h.get('completed', False))
+        }
+
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to get challenge history: {str(e)}"
+        )
+
+
+@app.post("/api/challenges/update-progress", tags=["Challenges"])
+async def update_challenge_progress(
+    payload: dict = Body(...),
+    db: Database = Depends(get_database),
+    user_id_from_token: str = Depends(verify_token),
+):
+    """
+    Update progress on today's daily challenge.
+
+    Requires JWT authentication. User ID is extracted from the token.
+
+    Request body:
+        challenge_type: Type of challenge (e.g., "complete_exercises")
+        progress: Current progress value
+
+    Returns:
+        Updated progress record
+    """
+    try:
+        user_id = uuid.UUID(user_id_from_token)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid user_id from token")
+
+    # Auto-create user profile if doesn't exist
+    get_or_create_user(str(user_id))
+
+    challenge_type = payload.get("challenge_type")
+    progress = payload.get("progress")
+
+    if not challenge_type or progress is None:
+        raise HTTPException(
+            status_code=400,
+            detail="Missing challenge_type or progress"
+        )
+
+    try:
+        # Update progress
+        result = db.update_challenge_progress(
+            user_id=user_id,
+            challenge_type=challenge_type,
+            progress=progress
+        )
+
+        # Check if challenge is now complete
+        if result and result.get('completed') and not result.get('completed_at'):
+            # Auto-complete the challenge
+            db.complete_daily_challenge(user_id)
+
+        # Get the challenge definition
+        challenge = db.get_daily_challenge()
+
+        return {
+            "progress": result.get('progress', 0) if result else 0,
+            "goal": result.get('goal', challenge.get('goal', 0)) if result else challenge.get('goal', 0),
+            "completed": result.get('completed', False) if result else False,
+            "challenge": challenge
+        }
+
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to update challenge progress: {str(e)}"
+        )
+
+
+# ============================================
+# Learning Path Endpoints
+# ============================================
+
+@app.get("/api/learning-path/units")
+async def get_learning_path_units(user: dict = Depends(verify_token)):
+    """Get all learning units with user progress."""
+    db = get_db()
+    user_id = user["user_id"]
+
+    try:
+        with db.get_connection() as conn:
+            with conn.cursor() as cur:
+                # Get all units with user progress
+                cur.execute("""
+                    SELECT
+                        lu.unit_id,
+                        lu.unit_number,
+                        lu.level,
+                        lu.title,
+                        lu.description,
+                        lu.icon,
+                        lu.color,
+                        lu.order_index,
+                        lu.is_locked,
+                        lu.estimated_time_minutes,
+                        lu.metadata,
+                        COALESCE(uup.lessons_completed, 0) as lessons_completed,
+                        (SELECT COUNT(*) FROM learning_lessons WHERE unit_id = lu.unit_id) as total_lessons,
+                        COALESCE(uup.completed, FALSE) as completed,
+                        COALESCE(uup.test_passed, FALSE) as test_passed
+                    FROM learning_units lu
+                    LEFT JOIN user_unit_progress uup ON lu.unit_id = uup.unit_id AND uup.user_id = %s
+                    ORDER BY lu.order_index ASC
+                """, (user_id,))
+
+                units = []
+                rows = cur.fetchall()
+
+                for row in rows:
+                    units.append({
+                        "unit_id": str(row[0]),
+                        "unit_number": row[1],
+                        "level": row[2],
+                        "title": row[3],
+                        "description": row[4],
+                        "icon": row[5],
+                        "color": row[6],
+                        "order_index": row[7],
+                        "is_locked": row[8],
+                        "estimated_time_minutes": row[9],
+                        "metadata": row[10],
+                        "lessons_completed": row[11],
+                        "total_lessons": row[12],
+                        "completed": row[13],
+                        "test_passed": row[14]
+                    })
+
+                # Unlock logic: first unit always unlocked, others unlock when previous is completed
+                for i, unit in enumerate(units):
+                    if i == 0:
+                        unit["is_locked"] = False
+                    elif i > 0 and units[i-1]["completed"]:
+                        unit["is_locked"] = False
+
+                return {"units": units, "total": len(units)}
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to get learning path: {str(e)}")
+
+
+@app.get("/api/learning-path/units/{unit_id}")
+async def get_unit_detail(unit_id: str, user: dict = Depends(verify_token)):
+    """Get unit details with lessons and user progress."""
+    db = get_db()
+    user_id = user["user_id"]
+
+    try:
+        with db.get_connection() as conn:
+            with conn.cursor() as cur:
+                # Get unit info
+                cur.execute("""
+                    SELECT
+                        lu.*,
+                        COALESCE(uup.lessons_completed, 0) as user_lessons_completed,
+                        COALESCE(uup.completed, FALSE) as user_completed,
+                        COALESCE(uup.test_passed, FALSE) as user_test_passed,
+                        uup.test_score
+                    FROM learning_units lu
+                    LEFT JOIN user_unit_progress uup ON lu.unit_id = uup.unit_id AND uup.user_id = %s
+                    WHERE lu.unit_id = %s
+                """, (user_id, unit_id))
+
+                unit_row = cur.fetchone()
+                if not unit_row:
+                    raise HTTPException(status_code=404, detail="Unit not found")
+
+                # Get lessons with progress
+                cur.execute("""
+                    SELECT
+                        ll.lesson_id,
+                        ll.lesson_number,
+                        ll.title,
+                        ll.description,
+                        ll.lesson_type,
+                        ll.order_index,
+                        ll.xp_reward,
+                        ll.is_locked,
+                        ll.estimated_time_minutes,
+                        ll.content,
+                        COALESCE(ulp.completed, FALSE) as completed,
+                        ulp.score,
+                        (SELECT COUNT(*) FROM lesson_exercises WHERE lesson_id = ll.lesson_id) as exercise_count
+                    FROM learning_lessons ll
+                    LEFT JOIN user_lesson_progress ulp ON ll.lesson_id = ulp.lesson_id AND ulp.user_id = %s
+                    WHERE ll.unit_id = %s
+                    ORDER BY ll.order_index ASC
+                """, (user_id, unit_id))
+
+                lessons = []
+                lesson_rows = cur.fetchall()
+
+                for i, row in enumerate(lesson_rows):
+                    is_locked = row[7]
+                    # First lesson unlocked, others unlock when previous completed
+                    if i == 0:
+                        is_locked = False
+                    elif i > 0 and lessons[i-1]["completed"]:
+                        is_locked = False
+
+                    lessons.append({
+                        "lesson_id": str(row[0]),
+                        "lesson_number": row[1],
+                        "title": row[2],
+                        "description": row[3],
+                        "lesson_type": row[4],
+                        "order_index": row[5],
+                        "xp_reward": row[6],
+                        "is_locked": is_locked,
+                        "estimated_time_minutes": row[8],
+                        "content": row[9],
+                        "completed": row[10],
+                        "score": row[11],
+                        "exercise_count": row[12]
+                    })
+
+                return {
+                    "unit": {
+                        "unit_id": str(unit_row[0]),
+                        "unit_number": unit_row[1],
+                        "level": unit_row[2],
+                        "title": unit_row[3],
+                        "description": unit_row[4],
+                        "icon": unit_row[5],
+                        "color": unit_row[6],
+                        "lessons_completed": unit_row[13],
+                        "completed": unit_row[14],
+                        "test_passed": unit_row[15],
+                        "test_score": unit_row[16]
+                    },
+                    "lessons": lessons,
+                    "total_lessons": len(lessons)
+                }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to get unit: {str(e)}")
+
+
+@app.get("/api/learning-path/lessons/{lesson_id}")
+async def get_lesson_detail(lesson_id: str, user: dict = Depends(verify_token)):
+    """Get lesson details with exercises."""
+    db = get_db()
+    user_id = user["user_id"]
+
+    try:
+        with db.get_connection() as conn:
+            with conn.cursor() as cur:
+                # Get lesson info
+                cur.execute("""
+                    SELECT
+                        ll.*,
+                        lu.title as unit_title,
+                        lu.level,
+                        COALESCE(ulp.completed, FALSE) as user_completed,
+                        COALESCE(ulp.score, 0) as user_score,
+                        COALESCE(ulp.exercises_completed, 0) as user_exercises_completed,
+                        COALESCE(ulp.current_exercise_index, 0) as current_exercise_index
+                    FROM learning_lessons ll
+                    JOIN learning_units lu ON ll.unit_id = lu.unit_id
+                    LEFT JOIN user_lesson_progress ulp ON ll.lesson_id = ulp.lesson_id AND ulp.user_id = %s
+                    WHERE ll.lesson_id = %s
+                """, (user_id, lesson_id))
+
+                lesson_row = cur.fetchone()
+                if not lesson_row:
+                    raise HTTPException(status_code=404, detail="Lesson not found")
+
+                # Get exercises for this lesson
+                cur.execute("""
+                    SELECT exercise_id, order_index, is_required
+                    FROM lesson_exercises
+                    WHERE lesson_id = %s
+                    ORDER BY order_index ASC
+                """, (lesson_id,))
+
+                exercise_ids = []
+                for row in cur.fetchall():
+                    exercise_ids.append({
+                        "exercise_id": row[0],
+                        "order_index": row[1],
+                        "is_required": row[2]
+                    })
+
+                # Get actual exercises from exercises pool
+                from app.exercises import EXERCISES
+                exercises = []
+                for ex in exercise_ids:
+                    exercise_data = next((e for e in EXERCISES if e["id"] == ex["exercise_id"]), None)
+                    if exercise_data:
+                        exercises.append({
+                            **exercise_data,
+                            "order_index": ex["order_index"],
+                            "is_required": ex["is_required"]
+                        })
+
+                return {
+                    "lesson": {
+                        "lesson_id": str(lesson_row[0]),
+                        "unit_id": str(lesson_row[1]),
+                        "lesson_number": lesson_row[2],
+                        "title": lesson_row[3],
+                        "description": lesson_row[4],
+                        "lesson_type": lesson_row[5],
+                        "xp_reward": lesson_row[7],
+                        "estimated_time_minutes": lesson_row[9],
+                        "content": lesson_row[10],
+                        "unit_title": lesson_row[13],
+                        "level": lesson_row[14],
+                        "completed": lesson_row[15],
+                        "user_score": lesson_row[16],
+                        "exercises_completed": lesson_row[17],
+                        "current_exercise_index": lesson_row[18]
+                    },
+                    "exercises": exercises,
+                    "total_exercises": len(exercises)
+                }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to get lesson: {str(e)}")
+
+
+class CompleteLessonRequest(BaseModel):
+    score: int = Field(..., ge=0, le=100)
+    mistakes_count: int = 0
+    time_spent_seconds: int = 0
+
+
+@app.post("/api/learning-path/lessons/{lesson_id}/complete")
+async def complete_lesson(lesson_id: str, request: CompleteLessonRequest, user: dict = Depends(verify_token)):
+    """Mark a lesson as complete and award XP."""
+    db = get_db()
+    user_id = user["user_id"]
+
+    try:
+        with db.get_connection() as conn:
+            with conn.cursor() as cur:
+                # Get lesson info
+                cur.execute("""
+                    SELECT ll.*, lu.unit_id
+                    FROM learning_lessons ll
+                    JOIN learning_units lu ON ll.unit_id = lu.unit_id
+                    WHERE ll.lesson_id = %s
+                """, (lesson_id,))
+
+                lesson = cur.fetchone()
+                if not lesson:
+                    raise HTTPException(status_code=404, detail="Lesson not found")
+
+                xp_reward = lesson[7]  # xp_reward column
+                unit_id = lesson[1]    # unit_id column
+
+                # Upsert lesson progress
+                cur.execute("""
+                    INSERT INTO user_lesson_progress (user_id, lesson_id, completed, score, mistakes_count, time_spent_seconds, completed_at)
+                    VALUES (%s, %s, TRUE, %s, %s, %s, NOW())
+                    ON CONFLICT (user_id, lesson_id)
+                    DO UPDATE SET
+                        completed = TRUE,
+                        score = GREATEST(user_lesson_progress.score, EXCLUDED.score),
+                        mistakes_count = user_lesson_progress.mistakes_count + EXCLUDED.mistakes_count,
+                        time_spent_seconds = user_lesson_progress.time_spent_seconds + EXCLUDED.time_spent_seconds,
+                        completed_at = NOW()
+                    RETURNING id
+                """, (user_id, lesson_id, request.score, request.mistakes_count, request.time_spent_seconds))
+
+                # Update unit progress
+                cur.execute("""
+                    SELECT COUNT(*) FROM learning_lessons WHERE unit_id = %s
+                """, (unit_id,))
+                total_lessons = cur.fetchone()[0]
+
+                cur.execute("""
+                    SELECT COUNT(*) FROM user_lesson_progress ulp
+                    JOIN learning_lessons ll ON ulp.lesson_id = ll.lesson_id
+                    WHERE ulp.user_id = %s AND ll.unit_id = %s AND ulp.completed = TRUE
+                """, (user_id, unit_id))
+                lessons_completed = cur.fetchone()[0]
+
+                unit_completed = lessons_completed >= total_lessons
+
+                cur.execute("""
+                    INSERT INTO user_unit_progress (user_id, unit_id, lessons_completed, total_lessons, completed, completed_at)
+                    VALUES (%s, %s, %s, %s, %s, CASE WHEN %s THEN NOW() ELSE NULL END)
+                    ON CONFLICT (user_id, unit_id)
+                    DO UPDATE SET
+                        lessons_completed = EXCLUDED.lessons_completed,
+                        total_lessons = EXCLUDED.total_lessons,
+                        completed = EXCLUDED.completed,
+                        completed_at = CASE WHEN EXCLUDED.completed AND NOT user_unit_progress.completed THEN NOW() ELSE user_unit_progress.completed_at END
+                """, (user_id, unit_id, lessons_completed, total_lessons, unit_completed, unit_completed))
+
+                # Award XP to user profile
+                cur.execute("""
+                    UPDATE user_profiles
+                    SET xp = COALESCE(xp, 0) + %s
+                    WHERE user_id = %s
+                """, (xp_reward, user_id))
+
+                conn.commit()
+
+                return {
+                    "success": True,
+                    "xp_earned": xp_reward,
+                    "score": request.score,
+                    "unit_progress": {
+                        "lessons_completed": lessons_completed,
+                        "total_lessons": total_lessons,
+                        "unit_completed": unit_completed
+                    }
+                }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to complete lesson: {str(e)}")
+
+
+@app.get("/api/learning-path/next-lesson")
+async def get_next_lesson(user: dict = Depends(verify_token)):
+    """Get the next recommended lesson for the user."""
+    db = get_db()
+    user_id = user["user_id"]
+
+    try:
+        with db.get_connection() as conn:
+            with conn.cursor() as cur:
+                # Find first incomplete lesson that's unlocked
+                cur.execute("""
+                    WITH completed_lessons AS (
+                        SELECT lesson_id FROM user_lesson_progress
+                        WHERE user_id = %s AND completed = TRUE
+                    ),
+                    completed_units AS (
+                        SELECT unit_id FROM user_unit_progress
+                        WHERE user_id = %s AND completed = TRUE
+                    )
+                    SELECT
+                        ll.lesson_id,
+                        ll.title as lesson_title,
+                        ll.lesson_number,
+                        lu.unit_id,
+                        lu.title as unit_title,
+                        lu.level,
+                        ll.xp_reward,
+                        ll.estimated_time_minutes
+                    FROM learning_lessons ll
+                    JOIN learning_units lu ON ll.unit_id = lu.unit_id
+                    WHERE ll.lesson_id NOT IN (SELECT lesson_id FROM completed_lessons)
+                    AND (
+                        lu.order_index = 1  -- First unit always available
+                        OR lu.prerequisite_unit_id IN (SELECT unit_id FROM completed_units)
+                        OR lu.prerequisite_unit_id IS NULL
+                    )
+                    ORDER BY lu.order_index, ll.order_index
+                    LIMIT 1
+                """, (user_id, user_id))
+
+                row = cur.fetchone()
+
+                if not row:
+                    return {"next_lesson": None, "message": "All lessons completed!"}
+
+                return {
+                    "next_lesson": {
+                        "lesson_id": str(row[0]),
+                        "lesson_title": row[1],
+                        "lesson_number": row[2],
+                        "unit_id": str(row[3]),
+                        "unit_title": row[4],
+                        "level": row[5],
+                        "xp_reward": row[6],
+                        "estimated_time_minutes": row[7]
+                    }
+                }
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to get next lesson: {str(e)}")
+
+
+@app.post("/api/learning-path/seed")
+async def seed_learning_path():
+    """Seed the learning path with initial data (admin only - no auth for now)."""
+    db = get_db()
+
+    try:
+        with db.get_connection() as conn:
+            with conn.cursor() as cur:
+                # Check if data already exists
+                cur.execute("SELECT COUNT(*) FROM learning_units")
+                if cur.fetchone()[0] > 0:
+                    return {"message": "Learning path already seeded", "seeded": False}
+
+                # Seed Unit 1: Greetings & Introductions
+                cur.execute("""
+                    INSERT INTO learning_units (unit_id, unit_number, level, title, description, icon, color, order_index, is_locked, estimated_time_minutes, metadata)
+                    VALUES (%s, 1, 'A1', 'Greetings & Introductions', 'Learn how to greet people and introduce yourself in English.', 'wave', '#10B981', 1, FALSE, 30, %s)
+                """, ('00000001-0000-0000-0000-000000000001', json.dumps({"skills": ["greetings", "introductions"]})))
+
+                # Seed Unit 1 Lessons
+                cur.execute("""
+                    INSERT INTO learning_lessons (lesson_id, unit_id, lesson_number, title, description, lesson_type, order_index, xp_reward, is_locked, estimated_time_minutes, content)
+                    VALUES
+                    (%s, %s, 1, 'Hello & Goodbye', 'Learn basic greetings and farewells', 'standard', 1, 10, FALSE, 5, %s),
+                    (%s, %s, 2, 'My Name Is...', 'Learn to introduce yourself', 'standard', 2, 10, TRUE, 5, %s),
+                    (%s, %s, 3, 'Where Are You From?', 'Talk about your country and nationality', 'standard', 3, 15, TRUE, 7, %s)
+                """, (
+                    '00000001-0001-0000-0000-000000000001', '00000001-0000-0000-0000-000000000001',
+                    json.dumps({"intro": "Welcome! In this lesson you will learn how to say hello and goodbye in English.", "tips": ["Hello is formal", "Hi is casual", "Goodbye when leaving"]}),
+                    '00000001-0001-0000-0000-000000000002', '00000001-0000-0000-0000-000000000001',
+                    json.dumps({"intro": "Learn how to introduce yourself and ask for names.", "tips": ["My name is... is formal", "I'm... is casual"]}),
+                    '00000001-0001-0000-0000-000000000003', '00000001-0000-0000-0000-000000000001',
+                    json.dumps({"intro": "Learn to talk about where you are from.", "tips": ["I am from + country", "Nationalities: American, British, Spanish"]})
+                ))
+
+                # Seed Unit 2: Present Tense Basics
+                cur.execute("""
+                    INSERT INTO learning_units (unit_id, unit_number, level, title, description, icon, color, order_index, is_locked, prerequisite_unit_id, estimated_time_minutes, metadata)
+                    VALUES (%s, 2, 'A1', 'Present Tense Basics', 'Master the present simple tense with to be and regular verbs.', 'book', '#3B82F6', 2, TRUE, %s, 45, %s)
+                """, ('00000001-0000-0000-0000-000000000002', '00000001-0000-0000-0000-000000000001', json.dumps({"skills": ["present_simple", "to_be"]})))
+
+                # Seed Unit 2 Lessons
+                cur.execute("""
+                    INSERT INTO learning_lessons (lesson_id, unit_id, lesson_number, title, description, lesson_type, order_index, xp_reward, is_locked, estimated_time_minutes, content)
+                    VALUES
+                    (%s, %s, 1, 'To Be Verb', 'Learn all forms of the verb to be (am, is, are)', 'standard', 4, 15, TRUE, 8, %s),
+                    (%s, %s, 2, 'Present Simple Actions', 'Describe daily actions and routines', 'standard', 5, 15, TRUE, 8, %s),
+                    (%s, %s, 3, 'Questions with Do/Does', 'Ask questions in present simple', 'standard', 6, 15, TRUE, 8, %s)
+                """, (
+                    '00000001-0001-0000-0000-000000000004', '00000001-0000-0000-0000-000000000002',
+                    json.dumps({"intro": "The verb 'to be' is the most important verb in English!", "tips": ["I am", "You/We/They are", "He/She/It is"]}),
+                    '00000001-0001-0000-0000-000000000005', '00000001-0000-0000-0000-000000000002',
+                    json.dumps({"intro": "Use present simple for habits and routines.", "tips": ["I work", "She works (add -s)", "We eat breakfast"]}),
+                    '00000001-0001-0000-0000-000000000006', '00000001-0000-0000-0000-000000000002',
+                    json.dumps({"intro": "Learn to form questions with do and does.", "tips": ["Do you...?", "Does he/she...?", "Don't forget the base verb!"]})
+                ))
+
+                # Seed Unit 3: Everyday Vocabulary
+                cur.execute("""
+                    INSERT INTO learning_units (unit_id, unit_number, level, title, description, icon, color, order_index, is_locked, prerequisite_unit_id, estimated_time_minutes, metadata)
+                    VALUES (%s, 3, 'A1', 'Everyday Vocabulary', 'Learn essential vocabulary: numbers, colors, family, and objects.', 'star', '#F59E0B', 3, TRUE, %s, 40, %s)
+                """, ('00000001-0000-0000-0000-000000000003', '00000001-0000-0000-0000-000000000002', json.dumps({"skills": ["numbers", "colors", "family"]})))
+
+                # Seed Unit 3 Lessons
+                cur.execute("""
+                    INSERT INTO learning_lessons (lesson_id, unit_id, lesson_number, title, description, lesson_type, order_index, xp_reward, is_locked, estimated_time_minutes, content)
+                    VALUES
+                    (%s, %s, 1, 'Numbers 1-100', 'Learn to count in English', 'standard', 7, 10, TRUE, 6, %s),
+                    (%s, %s, 2, 'Colors & Adjectives', 'Learn common colors and descriptions', 'standard', 8, 10, TRUE, 6, %s)
+                """, (
+                    '00000001-0001-0000-0000-000000000007', '00000001-0000-0000-0000-000000000003',
+                    json.dumps({"intro": "Numbers are essential for everyday life!", "tips": ["1-10 are unique", "11-19 end in -teen", "20, 30, 40 end in -ty"]}),
+                    '00000001-0001-0000-0000-000000000008', '00000001-0000-0000-0000-000000000003',
+                    json.dumps({"intro": "Learn to describe things with colors and adjectives.", "tips": ["Colors come before nouns", "The big red car", "A blue sky"]})
+                ))
+
+                # Link exercises to lessons (using existing exercise IDs from exercises.py)
+                # Lesson 1: Hello & Goodbye
+                cur.execute("""
+                    INSERT INTO lesson_exercises (lesson_id, exercise_id, order_index)
+                    VALUES
+                    (%s, 'mc-vocab-a1-001', 1),
+                    (%s, 'mc-vocab-a1-002', 2),
+                    (%s, 'fill-vocab-a1-001', 3),
+                    (%s, 'fill-vocab-a1-002', 4),
+                    (%s, 'mc-vocab-a1-003', 5)
+                """, ('00000001-0001-0000-0000-000000000001',) * 5)
+
+                # Lesson 2: My Name Is
+                cur.execute("""
+                    INSERT INTO lesson_exercises (lesson_id, exercise_id, order_index)
+                    VALUES
+                    (%s, 'mc-gram-a1-001', 1),
+                    (%s, 'fill-gram-a1-001', 2),
+                    (%s, 'fill-gram-a1-002', 3),
+                    (%s, 'mc-gram-a1-002', 4)
+                """, ('00000001-0001-0000-0000-000000000002',) * 4)
+
+                # Lesson 3: Where Are You From
+                cur.execute("""
+                    INSERT INTO lesson_exercises (lesson_id, exercise_id, order_index)
+                    VALUES
+                    (%s, 'mc-vocab-a1-004', 1),
+                    (%s, 'mc-vocab-a1-005', 2),
+                    (%s, 'fill-vocab-a1-003', 3),
+                    (%s, 'fill-vocab-a1-004', 4),
+                    (%s, 'mc-gram-a1-003', 5)
+                """, ('00000001-0001-0000-0000-000000000003',) * 5)
+
+                # Lesson 4: To Be Verb
+                cur.execute("""
+                    INSERT INTO lesson_exercises (lesson_id, exercise_id, order_index)
+                    VALUES
+                    (%s, 'mc-gram-a1-004', 1),
+                    (%s, 'fill-gram-a1-003', 2),
+                    (%s, 'fill-gram-a1-004', 3),
+                    (%s, 'corr-gram-a1-001', 4),
+                    (%s, 'mc-gram-a1-005', 5)
+                """, ('00000001-0001-0000-0000-000000000004',) * 5)
+
+                # Lesson 5: Present Simple
+                cur.execute("""
+                    INSERT INTO lesson_exercises (lesson_id, exercise_id, order_index)
+                    VALUES
+                    (%s, 'mc-gram-a1-006', 1),
+                    (%s, 'fill-gram-a1-005', 2),
+                    (%s, 'fill-gram-a1-006', 3),
+                    (%s, 'corr-gram-a1-002', 4)
+                """, ('00000001-0001-0000-0000-000000000005',) * 4)
+
+                # Lesson 6: Questions
+                cur.execute("""
+                    INSERT INTO lesson_exercises (lesson_id, exercise_id, order_index)
+                    VALUES
+                    (%s, 'mc-gram-a1-007', 1),
+                    (%s, 'fill-gram-a1-007', 2),
+                    (%s, 'fill-gram-a1-008', 3),
+                    (%s, 'corr-gram-a1-003', 4)
+                """, ('00000001-0001-0000-0000-000000000006',) * 4)
+
+                # Lesson 7: Numbers
+                cur.execute("""
+                    INSERT INTO lesson_exercises (lesson_id, exercise_id, order_index)
+                    VALUES
+                    (%s, 'mc-vocab-a1-006', 1),
+                    (%s, 'mc-vocab-a1-007', 2),
+                    (%s, 'fill-vocab-a1-005', 3),
+                    (%s, 'fill-vocab-a1-006', 4)
+                """, ('00000001-0001-0000-0000-000000000007',) * 4)
+
+                # Lesson 8: Colors
+                cur.execute("""
+                    INSERT INTO lesson_exercises (lesson_id, exercise_id, order_index)
+                    VALUES
+                    (%s, 'mc-vocab-a1-008', 1),
+                    (%s, 'mc-vocab-a1-009', 2),
+                    (%s, 'fill-vocab-a1-007', 3),
+                    (%s, 'fill-vocab-a1-008', 4)
+                """, ('00000001-0001-0000-0000-000000000008',) * 4)
+
+                conn.commit()
+
+                return {
+                    "message": "Learning path seeded successfully!",
+                    "seeded": True,
+                    "units_created": 3,
+                    "lessons_created": 8
+                }
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to seed learning path: {str(e)}")
+
+
+# ============================================================================
+# Diagnostic Test Endpoints
+# ============================================================================
+
+class DiagnosticAnswerRequest(BaseModel):
+    """Request for submitting a diagnostic answer."""
+    session_id: str
+    exercise_id: str
+    user_answer: str
+
+
+@app.get("/api/diagnostic/start", tags=["Diagnostic"])
+async def start_diagnostic_test(
+    db: Database = Depends(get_database),
+    user_id_from_token: str = Depends(verify_token),
+):
+    """
+    Start a new diagnostic test session.
+
+    Creates a new session starting at A2 level and returns the first question.
+    If an in-progress session exists, resumes that session.
+    """
+    try:
+        user_id = uuid.UUID(user_id_from_token)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid user_id from token")
+
+    try:
+        repo = DiagnosticRepository(db)
+        engine = DiagnosticEngine(db)
+
+        # Check for existing in-progress session
+        session = repo.get_active_session_for_user(user_id)
+
+        if session:
+            # Resume existing session
+            used_ids = repo.get_used_exercise_ids(session.session_id)
+            next_question = engine.select_next_question(session, used_ids)
+
+            if not next_question:
+                # No more questions - complete the session
+                session.status = "completed"
+                session.completed_at = datetime.utcnow()
+                session.user_level = engine._compute_user_level(session.stats)
+                repo.update_session(session)
+
+                # Seed mastery
+                answers = repo.get_session_answers(session.session_id)
+                seed_initial_mastery(db, user_id, session.user_level, answers)
+
+                return {
+                    "done": True,
+                    "user_level": session.user_level,
+                    "summary": {
+                        "stats": session.stats,
+                        "questions_answered": session.questions_answered
+                    }
+                }
+
+            return {
+                "session_id": str(session.session_id),
+                "resuming": True,
+                "question": {
+                    "exercise_id": next_question.exercise_id,
+                    "level": next_question.level,
+                    "question": next_question.question,
+                    "options": next_question.options,
+                    "type": next_question.exercise_type.value
+                },
+                "progress": {
+                    "answered": session.questions_answered,
+                    "max": session.max_questions
+                }
+            }
+
+        # Create new session
+        session = DiagnosticSession.create_new(user_id)
+        repo.create_session(session)
+
+        # Select first question
+        next_question = engine.select_next_question(session, [])
+
+        if not next_question:
+            raise HTTPException(status_code=500, detail="No diagnostic exercises available")
+
+        return {
+            "session_id": str(session.session_id),
+            "resuming": False,
+            "question": {
+                "exercise_id": next_question.exercise_id,
+                "level": next_question.level,
+                "question": next_question.question,
+                "options": next_question.options,
+                "type": next_question.exercise_type.value
+            },
+            "progress": {
+                "answered": 0,
+                "max": session.max_questions
+            }
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to start diagnostic: {str(e)}")
+
+
+@app.post("/api/diagnostic/answer", tags=["Diagnostic"])
+async def submit_diagnostic_answer(
+    request: DiagnosticAnswerRequest,
+    db: Database = Depends(get_database),
+    user_id_from_token: str = Depends(verify_token),
+):
+    """
+    Submit an answer for a diagnostic question.
+
+    Grades the answer, updates session state, and returns the next question
+    or completion summary.
+    """
+    try:
+        user_id = uuid.UUID(user_id_from_token)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid user_id from token")
+
+    try:
+        session_id = uuid.UUID(request.session_id)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid session_id")
+
+    try:
+        repo = DiagnosticRepository(db)
+        engine = DiagnosticEngine(db)
+
+        # Load session
+        session = repo.get_session(session_id)
+        if not session:
+            raise HTTPException(status_code=404, detail="Session not found")
+
+        if session.status != "in_progress":
+            raise HTTPException(status_code=400, detail="Session already completed")
+
+        if str(session.user_id) != str(user_id):
+            raise HTTPException(status_code=403, detail="Session belongs to another user")
+
+        # Load exercise
+        exercise = EXERCISES.get(request.exercise_id)
+        if not exercise:
+            raise HTTPException(status_code=404, detail="Exercise not found")
+
+        if not is_diagnostic_exercise(request.exercise_id):
+            raise HTTPException(status_code=400, detail="Exercise is not a diagnostic exercise")
+
+        # Grade answer
+        is_correct = engine.grade_answer(exercise, request.user_answer)
+
+        # Get skill_key from exercise
+        skill_key = exercise.skill_keys[0] if exercise.skill_keys else ""
+
+        # Record answer
+        answer = DiagnosticAnswer(
+            id=uuid.uuid4(),
+            session_id=session_id,
+            question_index=session.questions_answered,
+            exercise_id=request.exercise_id,
+            skill_key=skill_key,
+            level=exercise.level,
+            user_answer=request.user_answer,
+            is_correct=is_correct,
+            created_at=datetime.utcnow(),
+        )
+        repo.add_answer(answer)
+
+        # Update session
+        session = engine.update_session_after_answer(session, exercise, is_correct)
+        repo.update_session(session)
+
+        # Check if done
+        if session.status == "completed":
+            # Seed mastery based on results
+            answers = repo.get_session_answers(session_id)
+            seed_initial_mastery(db, user_id, session.user_level, answers)
+
+            return {
+                "done": True,
+                "is_correct": is_correct,
+                "correct_answer": exercise.correct_answer,
+                "user_level": session.user_level,
+                "summary": {
+                    "stats": session.stats,
+                    "questions_answered": session.questions_answered
+                }
+            }
+
+        # Select next question
+        used_ids = repo.get_used_exercise_ids(session_id)
+        next_question = engine.select_next_question(session, used_ids)
+
+        if not next_question:
+            # No more questions available - complete session
+            session.status = "completed"
+            session.completed_at = datetime.utcnow()
+            session.user_level = engine._compute_user_level(session.stats)
+            repo.update_session(session)
+
+            # Seed mastery
+            answers = repo.get_session_answers(session_id)
+            seed_initial_mastery(db, user_id, session.user_level, answers)
+
+            return {
+                "done": True,
+                "is_correct": is_correct,
+                "correct_answer": exercise.correct_answer,
+                "user_level": session.user_level,
+                "summary": {
+                    "stats": session.stats,
+                    "questions_answered": session.questions_answered
+                }
+            }
+
+        return {
+            "done": False,
+            "is_correct": is_correct,
+            "correct_answer": exercise.correct_answer,
+            "question": {
+                "exercise_id": next_question.exercise_id,
+                "level": next_question.level,
+                "question": next_question.question,
+                "options": next_question.options,
+                "type": next_question.exercise_type.value
+            },
+            "progress": {
+                "answered": session.questions_answered,
+                "max": session.max_questions
+            }
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to submit answer: {str(e)}")
+
+
+@app.post("/admin/migrate/010", tags=["Admin"])
+async def apply_migration_010(
+    db: Database = Depends(get_database),
+):
+    """Apply migration 010: Diagnostic tables."""
+    import os
+
+    migration_path = os.path.join(
+        os.path.dirname(os.path.dirname(__file__)),
+        "database", "migration_010_diagnostic.sql"
+    )
+
+    if not os.path.exists(migration_path):
+        raise HTTPException(status_code=404, detail=f"Migration file not found: {migration_path}")
+
+    try:
+        with open(migration_path, "r") as f:
+            migration_sql = f.read()
+
+        with db.get_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(migration_sql)
+                conn.commit()
+
+                # Verify tables exist
+                cur.execute("""
+                    SELECT table_name
+                    FROM information_schema.tables
+                    WHERE table_name IN ('diagnostic_sessions', 'diagnostic_answers')
+                """)
+                tables = cur.fetchall()
+
+                return {
+                    "status": "success",
+                    "message": "Migration 010 applied successfully",
+                    "tables_created": [t[0] if not isinstance(t, dict) else t['table_name'] for t in tables]
+                }
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Migration failed: {str(e)}")
+
+
+# ============================================================================
+# Guided Mode Endpoints (The Brain)
+# ============================================================================
+
+@app.get("/api/learn/guided", tags=["Guided"])
+async def get_guided_learning(
+    db: Database = Depends(get_database),
+    user_id_from_token: str = Depends(verify_token),
+):
+    """
+    Get guided learning recommendations.
+
+    Returns the 3-5 weakest skills (A1-B1 only) with a sample exercise for each.
+    This is the main "brain" endpoint that powers the learning experience.
+    """
+    try:
+        user_id = uuid.UUID(user_id_from_token)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid user_id from token")
+
+    try:
+        with db.get_connection() as conn:
+            with conn.cursor() as cur:
+                # Check if user has completed diagnostic
+                cur.execute("""
+                    SELECT session_id, user_level, status, completed_at
+                    FROM diagnostic_sessions
+                    WHERE user_id = %s AND status = 'completed'
+                    ORDER BY completed_at DESC
+                    LIMIT 1
+                """, (str(user_id),))
+                diagnostic_row = cur.fetchone()
+
+                has_diagnostic = diagnostic_row is not None
+                if has_diagnostic:
+                    if isinstance(diagnostic_row, dict):
+                        user_level = diagnostic_row.get('user_level', 'A2')
+                    else:
+                        user_level = diagnostic_row[1] if diagnostic_row[1] else 'A2'
+                else:
+                    user_level = None
+
+                # Get weakest skills (A1-B1 only), limit 5
+                cur.execute("""
+                    SELECT
+                        sd.skill_key,
+                        sd.name_en,
+                        sd.domain,
+                        sd.cefr_level,
+                        COALESCE(sgn.p_learned, 0.1) as p_learned,
+                        COALESCE(sgn.practice_count, 0) as practice_count
+                    FROM skill_definitions sd
+                    LEFT JOIN skill_graph_nodes sgn
+                        ON sd.skill_key = sgn.skill_key AND sgn.user_id = %s
+                    WHERE sd.is_active = TRUE
+                      AND sd.cefr_level IN ('A1', 'A2', 'B1')
+                    ORDER BY COALESCE(sgn.p_learned, 0.1) ASC, sd.difficulty ASC
+                    LIMIT 5
+                """, (str(user_id),))
+                rows = cur.fetchall()
+
+                skills = []
+                for row in rows:
+                    if isinstance(row, dict):
+                        skill_key = row['skill_key']
+                        skill_data = {
+                            "skill_key": skill_key,
+                            "name": row['name_en'],
+                            "domain": row['domain'],
+                            "level": row['cefr_level'],
+                            "p_learned": row['p_learned'],
+                            "practice_count": row['practice_count'],
+                        }
+                    else:
+                        skill_key = row[0]
+                        skill_data = {
+                            "skill_key": skill_key,
+                            "name": row[1],
+                            "domain": row[2],
+                            "level": row[3],
+                            "p_learned": row[4],
+                            "practice_count": row[5],
+                        }
+
+                    # Get a sample exercise for this skill
+                    exercises = get_exercises_by_skill_key(skill_key)
+                    if exercises:
+                        ex = random.choice(exercises)
+                        skill_data["sample_exercise"] = {
+                            "exercise_id": ex.exercise_id,
+                            "type": ex.exercise_type.value,
+                            "question": ex.question,
+                            "options": ex.options,
+                        }
+                    else:
+                        skill_data["sample_exercise"] = None
+
+                    skills.append(skill_data)
+
+                return {
+                    "has_diagnostic": has_diagnostic,
+                    "user_level": user_level,
+                    "skills": skills,
+                }
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to get guided learning: {str(e)}")
+
+
+@app.get("/api/progress/summary", tags=["Progress"])
+async def get_progress_summary(
+    db: Database = Depends(get_database),
+    user_id_from_token: str = Depends(verify_token),
+):
+    """
+    Get user's progress summary.
+
+    Returns:
+    - Current inferred level (from diagnostic or mastery)
+    - Aggregate mastery numbers (avg P(L) per CEFR band, % skills above 0.8)
+    - Minimal time-series (skills practiced counts)
+    """
+    try:
+        user_id = uuid.UUID(user_id_from_token)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid user_id from token")
+
+    try:
+        with db.get_connection() as conn:
+            with conn.cursor() as cur:
+                # Get diagnostic result for user level
+                cur.execute("""
+                    SELECT user_level, completed_at
+                    FROM diagnostic_sessions
+                    WHERE user_id = %s AND status = 'completed'
+                    ORDER BY completed_at DESC
+                    LIMIT 1
+                """, (str(user_id),))
+                diag_row = cur.fetchone()
+
+                if diag_row:
+                    if isinstance(diag_row, dict):
+                        user_level = diag_row.get('user_level', 'A2')
+                    else:
+                        user_level = diag_row[0] if diag_row[0] else 'A2'
+                else:
+                    user_level = None
+
+                # Get mastery stats per CEFR level
+                cur.execute("""
+                    SELECT
+                        sd.cefr_level,
+                        COUNT(sd.skill_key) as total_skills,
+                        COUNT(sgn.skill_key) as practiced_skills,
+                        COALESCE(AVG(sgn.p_learned), 0.1) as avg_mastery,
+                        COUNT(CASE WHEN sgn.p_learned >= 0.8 THEN 1 END) as mastered_count
+                    FROM skill_definitions sd
+                    LEFT JOIN skill_graph_nodes sgn
+                        ON sd.skill_key = sgn.skill_key AND sgn.user_id = %s
+                    WHERE sd.is_active = TRUE
+                      AND sd.cefr_level IN ('A1', 'A2', 'B1')
+                    GROUP BY sd.cefr_level
+                    ORDER BY sd.cefr_level
+                """, (str(user_id),))
+                level_rows = cur.fetchall()
+
+                levels = {}
+                total_skills = 0
+                total_mastered = 0
+                for row in level_rows:
+                    if isinstance(row, dict):
+                        level = row['cefr_level']
+                        avg_mastery = round(row['avg_mastery'], 3) if row['avg_mastery'] else 0.1
+                        levels[level] = {
+                            "total_skills": row['total_skills'],
+                            "mastered_skills": row['mastered_count'],
+                            "average_mastery": avg_mastery,
+                            "mastery_percentage": round(avg_mastery * 100, 1),
+                        }
+                        total_skills += row['total_skills']
+                        total_mastered += row['mastered_count']
+                    else:
+                        level = row[0]
+                        avg_mastery = round(row[3], 3) if row[3] else 0.1
+                        levels[level] = {
+                            "total_skills": row[1],
+                            "mastered_skills": row[4] if row[4] else 0,
+                            "average_mastery": avg_mastery,
+                            "mastery_percentage": round(avg_mastery * 100, 1),
+                        }
+                        total_skills += row[1]
+                        total_mastered += row[4] if row[4] else 0
+
+                # Calculate overall stats
+                overall_mastery_pct = round((total_mastered / total_skills) * 100, 1) if total_skills > 0 else 0
+
+                # Get recent practice activity (last 10 days)
+                cur.execute("""
+                    SELECT COUNT(DISTINCT skill_key) as skills_practiced
+                    FROM skill_graph_nodes
+                    WHERE user_id = %s
+                      AND last_practiced >= NOW() - INTERVAL '10 days'
+                """, (str(user_id),))
+                recent_row = cur.fetchone()
+                if isinstance(recent_row, dict):
+                    recent_skills_practiced = recent_row.get('skills_practiced', 0)
+                else:
+                    recent_skills_practiced = recent_row[0] if recent_row else 0
+
+                return {
+                    "user_level": user_level,
+                    "has_diagnostic": user_level is not None,
+                    "total_skills": total_skills,
+                    "mastered_skills": total_mastered,
+                    "mastery_percentage": overall_mastery_pct,
+                    "by_level": levels,
+                    "recent_activity": {
+                        "skills_practiced_last_10_days": recent_skills_practiced,
+                    }
+                }
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to get progress summary: {str(e)}")
+
+
+@app.get("/api/user/diagnostic-status", tags=["User"])
+async def get_diagnostic_status(
+    db: Database = Depends(get_database),
+    user_id_from_token: str = Depends(verify_token),
+):
+    """
+    Check if user has completed the diagnostic test.
+
+    Used by frontend to redirect new users to diagnostic.
+    """
+    try:
+        user_id = uuid.UUID(user_id_from_token)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid user_id from token")
+
+    try:
+        with db.get_connection() as conn:
+            with conn.cursor() as cur:
+                # Check for completed diagnostic
+                cur.execute("""
+                    SELECT session_id, user_level, completed_at
+                    FROM diagnostic_sessions
+                    WHERE user_id = %s AND status = 'completed'
+                    ORDER BY completed_at DESC
+                    LIMIT 1
+                """, (str(user_id),))
+                completed = cur.fetchone()
+
+                # Check for in-progress diagnostic
+                cur.execute("""
+                    SELECT session_id, questions_answered, max_questions
+                    FROM diagnostic_sessions
+                    WHERE user_id = %s AND status = 'in_progress'
+                    ORDER BY started_at DESC
+                    LIMIT 1
+                """, (str(user_id),))
+                in_progress = cur.fetchone()
+
+                if completed:
+                    if isinstance(completed, dict):
+                        return {
+                            "status": "completed",
+                            "user_level": completed.get('user_level'),
+                            "completed_at": completed.get('completed_at').isoformat() if completed.get('completed_at') else None,
+                        }
+                    else:
+                        return {
+                            "status": "completed",
+                            "user_level": completed[1],
+                            "completed_at": completed[2].isoformat() if completed[2] else None,
+                        }
+                elif in_progress:
+                    if isinstance(in_progress, dict):
+                        return {
+                            "status": "in_progress",
+                            "session_id": str(in_progress.get('session_id')),
+                            "questions_answered": in_progress.get('questions_answered'),
+                            "max_questions": in_progress.get('max_questions'),
+                        }
+                    else:
+                        return {
+                            "status": "in_progress",
+                            "session_id": str(in_progress[0]),
+                            "questions_answered": in_progress[1],
+                            "max_questions": in_progress[2],
+                        }
+                else:
+                    return {
+                        "status": "not_started",
+                    }
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to get diagnostic status: {str(e)}")
+
+
+# =============================================================================
+# THINKING IN ENGLISH ENDPOINTS
+# =============================================================================
+
+from app.thinking_engine import thinking_engine, MAX_TURNS_HARD_CAP, MIN_TURNS_FOR_XP
+
+
+@app.post("/api/think/start", tags=["Think"])
+async def start_thinking_session(
+    db: Database = Depends(get_database),
+    user_id_from_token: str = Depends(verify_token),
+):
+    """
+    Start a new Thinking in English session.
+    Returns a session ID and the first question from the AI.
+
+    Policies:
+    - Free users: 3 sessions/day max
+    - Only one active session per user (previous is auto-ended)
+    - Resumes existing active session if present
+    """
+    try:
+        user_id = uuid.UUID(user_id_from_token)
+
+        # Get user profile to determine level and subscription
+        profile = db.get_user(user_id)
+
+        # Default values for new/missing users (allows QA testing)
+        if not profile:
+            profile = {"level": "A2", "is_tester": True, "subscription_status": None}
+
+        # Check if user is paid (subscription_status or is_tester)
+        is_paid = profile.get("is_tester", False) or profile.get("subscription_status") == "active"
+
+        # Check for existing active session
+        existing_session = thinking_engine.get_active_session(str(user_id))
+        if existing_session:
+            # Return existing session
+            starter = thinking_engine.get_starter_question(existing_session.level)
+            return {
+                "session_id": existing_session.session_id,
+                "level": existing_session.level,
+                "max_turns": existing_session.max_turns,
+                "current_turn": len(existing_session.turns),
+                "ai_message": existing_session.turns[-1].ai_response if existing_session.turns else starter,
+                "question_asked": existing_session.turns[-1].question_asked if existing_session.turns else None,
+                "resuming": True,
+            }
+
+        # Check session limit for free users
+        if not thinking_engine.check_session_limit(str(user_id), is_paid):
+            raise HTTPException(
+                status_code=429,
+                detail="Daily session limit reached. Upgrade to premium for unlimited sessions."
+            )
+
+        # Determine level from profile
+        user_level = profile.get("level", "A2")
+        if user_level == "A1":
+            think_level = "A1"
+        elif user_level == "A2":
+            think_level = "A2"
+        else:  # B1, B2, C1, C2
+            think_level = "B1"
+
+        # Create new session using engine
+        session = thinking_engine.create_session(
+            user_id=str(user_id),
+            level=think_level,
+            source="learn",
+        )
+
+        # Get starter question
+        starter = thinking_engine.get_starter_question(think_level)
+
+        return {
+            "session_id": session.session_id,
+            "level": think_level,
+            "max_turns": session.max_turns,
+            "current_turn": 0,
+            "ai_message": starter,
+            "question_asked": starter,
+            "resuming": False,
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"Failed to start thinking session: {str(e)}")
+
+
+@app.post("/api/think/respond", tags=["Think"])
+async def respond_thinking_session(
+    payload: dict = Body(...),
+    db: Database = Depends(get_database),
+    user_id_from_token: str = Depends(verify_token),
+):
+    """
+    Respond to a Thinking in English session.
+    Takes user message and returns AI response with optional correction.
+
+    Edge cases handled:
+    - User says "idk" / "I don't know" -> simplified question
+    - User types in native language -> prompt to try English
+    - User gives very short answer -> ask for more (once)
+    - User mentions forbidden topic -> gentle redirect
+    """
+    try:
+        from app.llm_client import llm_client
+        from app.config import config
+
+        user_id = uuid.UUID(user_id_from_token)
+        session_id = payload.get("session_id")
+        # Accept both "message" and "user_message" for frontend compatibility
+        user_message = payload.get("user_message") or payload.get("message", "")
+        user_message = user_message.strip() if user_message else ""
+
+        if not session_id:
+            raise HTTPException(status_code=400, detail="session_id is required")
+        if not user_message:
+            raise HTTPException(status_code=400, detail="message is required")
+
+        # Get session
+        session = thinking_engine.sessions.get(session_id)
+        if not session:
+            raise HTTPException(status_code=404, detail="Session not found")
+
+        if session.user_id != str(user_id):
+            raise HTTPException(status_code=403, detail="Session belongs to another user")
+
+        # Hard cap check
+        if len(session.turns) >= MAX_TURNS_HARD_CAP:
+            summary = thinking_engine.end_session(session_id)
+            # XP is returned in summary, tracked via analytics
+            # TODO: Persist XP to database when XP table is ready
+            return {
+                "done": True,
+                "summary": summary,
+            }
+
+        # Check if already at max turns
+        if len(session.turns) >= session.max_turns:
+            summary = thinking_engine.end_session(session_id)
+            return {
+                "done": True,
+                "summary": summary,
+            }
+
+        # Preprocess message for edge cases (idk, native lang, short answer, forbidden topic)
+        processed_message, special_response = thinking_engine.preprocess_user_message(
+            user_message, session
+        )
+
+        # If we have a special response (guardrail triggered), use it directly
+        if special_response:
+            turn = thinking_engine.add_turn(session, processed_message, special_response)
+            is_done = len(session.turns) >= session.max_turns
+            response_data = {
+                "done": is_done,
+                "current_turn": len(session.turns),
+                "max_turns": session.max_turns,
+                "ai_message": special_response.get("message", ""),
+                "question_asked": special_response.get("question_asked", ""),
+                "correction": None,
+            }
+            if is_done:
+                summary = thinking_engine.end_session(session_id)
+                response_data["summary"] = summary
+            return response_data
+
+        # Normal flow: call LLM
+        context = thinking_engine.build_conversation_context(session)
+        system_prompt = thinking_engine.get_system_prompt(session.level)
+
+        ai_response_text = ""
+        if config.enable_llm and llm_client.client:
+            try:
+                if llm_client.provider == "openai":
+                    response = llm_client.client.chat.completions.create(
+                        model=llm_client.config.model,
+                        messages=[
+                            {"role": "system", "content": system_prompt},
+                            {"role": "user", "content": f"{context}\n\nUser: {processed_message}\n\nRespond with JSON:"}
+                        ],
+                        temperature=0.7,
+                        max_tokens=150,  # Reduced from 200 to enforce shorter responses
+                    )
+                    ai_response_text = response.choices[0].message.content
+                elif llm_client.provider == "anthropic":
+                    response = llm_client.client.messages.create(
+                        model=llm_client.config.model,
+                        max_tokens=150,
+                        system=system_prompt,
+                        messages=[
+                            {"role": "user", "content": f"{context}\n\nUser: {processed_message}\n\nRespond with JSON:"}
+                        ],
+                    )
+                    ai_response_text = response.content[0].text
+            except Exception as e:
+                print(f"[THINK] LLM call failed: {e}")
+                ai_response_text = ""
+
+        # Parse response with validation
+        if ai_response_text:
+            parsed = thinking_engine.parse_llm_response(ai_response_text, session.level)
+        else:
+            # Fallback response
+            fallback_questions = {
+                "A1": "That's nice! Do you like it?",
+                "A2": "Interesting! Can you tell me more?",
+                "B1": "I see! What do you think about that?",
+            }
+            q = fallback_questions.get(session.level, "Tell me more!")
+            parsed = {
+                "message": q,
+                "correction": None,
+                "question_asked": q,
+            }
+
+        # Add turn
+        turn = thinking_engine.add_turn(session, processed_message, parsed)
+
+        # Check if done
+        is_done = len(session.turns) >= session.max_turns
+
+        response_data = {
+            "done": is_done,
+            "current_turn": len(session.turns),
+            "max_turns": session.max_turns,
+            "ai_message": parsed.get("message", ""),
+            "question_asked": parsed.get("question_asked", ""),
+            "correction": turn.correction,
+        }
+
+        if is_done:
+            summary = thinking_engine.end_session(session_id)
+            response_data["summary"] = summary
+
+        return response_data
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"Failed to process thinking response: {str(e)}")
+
+
+@app.post("/api/think/end", tags=["Think"])
+async def end_thinking_session(
+    payload: dict = Body(...),
+    db: Database = Depends(get_database),
+    user_id_from_token: str = Depends(verify_token),
+):
+    """
+    End a Thinking in English session early.
+    Returns the session summary.
+
+    XP awarded only if:
+    - Full session (10 turns): 50 XP
+    - Partial (6+ turns): 25 XP
+    - Less than 6 turns: 0 XP
+    """
+    try:
+        user_id = uuid.UUID(user_id_from_token)
+        session_id = payload.get("session_id")
+
+        if not session_id:
+            raise HTTPException(status_code=400, detail="session_id is required")
+
+        session = thinking_engine.sessions.get(session_id)
+        if not session:
+            raise HTTPException(status_code=404, detail="Session not found")
+
+        if session.user_id != str(user_id):
+            raise HTTPException(status_code=403, detail="Session belongs to another user")
+
+        # End session and get summary
+        summary = thinking_engine.end_session(session_id)
+
+        # Persist XP to database
+        xp_earned = summary.get("xp_earned", 0)
+        total_xp = None
+        if xp_earned > 0:
+            try:
+                total_xp = add_user_xp(user_id_from_token, xp_earned)
+            except Exception as e:
+                print(f"Warning: Failed to add Think XP: {e}")
+
+        return {
+            "done": True,
+            "summary": summary,
+            "total_xp": total_xp,
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"Failed to end thinking session: {str(e)}")
+
+
+@app.get("/api/think/session/{session_id}", tags=["Think"])
+async def get_thinking_session(
+    session_id: str,
+    user_id_from_token: str = Depends(verify_token),
+):
+    """
+    Get the current state of a Thinking in English session.
+    """
+    try:
+        user_id = uuid.UUID(user_id_from_token)
+
+        session = thinking_engine.sessions.get(session_id)
+        if not session:
+            raise HTTPException(status_code=404, detail="Session not found")
+
+        if session.user_id != str(user_id):
+            raise HTTPException(status_code=403, detail="Session belongs to another user")
+
+        return session.to_dict()
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to get thinking session: {str(e)}")
 
 
 if __name__ == "__main__":

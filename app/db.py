@@ -596,6 +596,58 @@ class Database:
                     "last_active_date": None
                 }
 
+    def record_activity(self, user_id: uuid.UUID) -> Dict[str, Any]:
+        """
+        Record user activity and update their streak.
+
+        This calls the database stored function `update_user_streak` which:
+        - If first activity: creates streak record with 1 day
+        - If already logged today: does nothing
+        - If continuing from yesterday: increments streak
+        - If streak broken (gap > 1 day): resets to 1
+
+        Args:
+            user_id: User UUID
+
+        Returns:
+            Updated streak dict with current_streak, longest_streak, last_active_date
+        """
+        with self.get_connection() as conn:
+            with conn.cursor() as cur:
+                # Call the stored function to update streak
+                cur.execute("SELECT update_user_streak(%s)", (user_id,))
+
+                # Now fetch the updated streak data
+                cur.execute("""
+                    SELECT
+                        current_streak_days,
+                        longest_streak_days,
+                        last_activity_date,
+                        total_days_active,
+                        freeze_days_available
+                    FROM user_streaks
+                    WHERE user_id = %s
+                """, (user_id,))
+                result = cur.fetchone()
+
+                if result:
+                    return {
+                        "current_streak": result["current_streak_days"],
+                        "longest_streak": result["longest_streak_days"],
+                        "last_active_date": result["last_activity_date"].isoformat() if result["last_activity_date"] else None,
+                        "total_days_active": result["total_days_active"],
+                        "freeze_days_available": result["freeze_days_available"],
+                    }
+
+                # Should not happen, but fallback
+                return {
+                    "current_streak": 1,
+                    "longest_streak": 1,
+                    "last_active_date": datetime.now().date().isoformat(),
+                    "total_days_active": 1,
+                    "freeze_days_available": 2,
+                }
+
     # Achievements
 
     def get_achievements(self) -> List[Dict[str, Any]]:
@@ -850,6 +902,312 @@ class Database:
 
                 return goal
 
+    # Leaderboards
+
+    def get_weekly_leaderboard(self, limit: int = 50, current_user_id: Optional[uuid.UUID] = None) -> Dict[str, Any]:
+        """
+        Get top users by XP gained this week.
+
+        Args:
+            limit: Maximum number of users to return
+            current_user_id: Optional user ID to include their rank even if not in top 50
+
+        Returns:
+            Dict with leaderboard entries and current user's rank
+        """
+        with self.get_connection() as conn:
+            with conn.cursor() as cur:
+                # Get start of current week (Monday)
+                cur.execute("""
+                    WITH week_xp AS (
+                        SELECT
+                            up.user_id,
+                            COALESCE(up.full_name, 'User') as display_name,
+                            up.level,
+                            COALESCE(SUM(
+                                CASE
+                                    WHEN s.completed_at >= DATE_TRUNC('week', NOW()) THEN 10
+                                    ELSE 0
+                                END
+                            ), 0) as xp_this_week
+                        FROM user_profiles up
+                        LEFT JOIN sessions s ON up.user_id = s.user_id AND s.state = 'completed'
+                        GROUP BY up.user_id, up.full_name, up.level
+                    ),
+                    ranked AS (
+                        SELECT
+                            user_id,
+                            display_name,
+                            xp_this_week,
+                            level,
+                            ROW_NUMBER() OVER (ORDER BY xp_this_week DESC, user_id) as rank
+                        FROM week_xp
+                        WHERE xp_this_week > 0
+                    )
+                    SELECT * FROM ranked
+                    WHERE rank <= %s
+                    ORDER BY rank
+                """, (limit,))
+                leaderboard = cur.fetchall()
+
+                # Get current user's rank if not in top 50
+                current_user_rank = None
+                if current_user_id:
+                    cur.execute("""
+                        WITH week_xp AS (
+                            SELECT
+                                up.user_id,
+                                COALESCE(up.full_name, 'User') as display_name,
+                                up.level,
+                                COALESCE(SUM(
+                                    CASE
+                                        WHEN s.completed_at >= DATE_TRUNC('week', NOW()) THEN 10
+                                        ELSE 0
+                                    END
+                                ), 0) as xp_this_week
+                            FROM user_profiles up
+                            LEFT JOIN sessions s ON up.user_id = s.user_id AND s.state = 'completed'
+                            GROUP BY up.user_id, up.full_name, up.level
+                        ),
+                        ranked AS (
+                            SELECT
+                                user_id,
+                                display_name,
+                                xp_this_week,
+                                level,
+                                ROW_NUMBER() OVER (ORDER BY xp_this_week DESC, user_id) as rank
+                            FROM week_xp
+                        )
+                        SELECT * FROM ranked WHERE user_id = %s
+                    """, (current_user_id,))
+                    current_user_rank = cur.fetchone()
+
+                return {
+                    "leaderboard": leaderboard,
+                    "current_user": current_user_rank
+                }
+
+    def get_monthly_leaderboard(self, limit: int = 50, current_user_id: Optional[uuid.UUID] = None) -> Dict[str, Any]:
+        """
+        Get top users by XP gained this month.
+
+        Args:
+            limit: Maximum number of users to return
+            current_user_id: Optional user ID to include their rank even if not in top 50
+
+        Returns:
+            Dict with leaderboard entries and current user's rank
+        """
+        with self.get_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    WITH month_xp AS (
+                        SELECT
+                            up.user_id,
+                            COALESCE(up.full_name, 'User') as display_name,
+                            up.level,
+                            COALESCE(SUM(
+                                CASE
+                                    WHEN s.completed_at >= DATE_TRUNC('month', NOW()) THEN 10
+                                    ELSE 0
+                                END
+                            ), 0) as xp_this_month
+                        FROM user_profiles up
+                        LEFT JOIN sessions s ON up.user_id = s.user_id AND s.state = 'completed'
+                        GROUP BY up.user_id, up.full_name, up.level
+                    ),
+                    ranked AS (
+                        SELECT
+                            user_id,
+                            display_name,
+                            xp_this_month,
+                            level,
+                            ROW_NUMBER() OVER (ORDER BY xp_this_month DESC, user_id) as rank
+                        FROM month_xp
+                        WHERE xp_this_month > 0
+                    )
+                    SELECT * FROM ranked
+                    WHERE rank <= %s
+                    ORDER BY rank
+                """, (limit,))
+                leaderboard = cur.fetchall()
+
+                current_user_rank = None
+                if current_user_id:
+                    cur.execute("""
+                        WITH month_xp AS (
+                            SELECT
+                                up.user_id,
+                                COALESCE(up.full_name, 'User') as display_name,
+                                up.level,
+                                COALESCE(SUM(
+                                    CASE
+                                        WHEN s.completed_at >= DATE_TRUNC('month', NOW()) THEN 10
+                                        ELSE 0
+                                    END
+                                ), 0) as xp_this_month
+                            FROM user_profiles up
+                            LEFT JOIN sessions s ON up.user_id = s.user_id AND s.state = 'completed'
+                            GROUP BY up.user_id, up.full_name, up.level
+                        ),
+                        ranked AS (
+                            SELECT
+                                user_id,
+                                display_name,
+                                xp_this_month,
+                                level,
+                                ROW_NUMBER() OVER (ORDER BY xp_this_month DESC, user_id) as rank
+                            FROM month_xp
+                        )
+                        SELECT * FROM ranked WHERE user_id = %s
+                    """, (current_user_id,))
+                    current_user_rank = cur.fetchone()
+
+                return {
+                    "leaderboard": leaderboard,
+                    "current_user": current_user_rank
+                }
+
+    def get_alltime_leaderboard(self, limit: int = 50, current_user_id: Optional[uuid.UUID] = None) -> Dict[str, Any]:
+        """
+        Get top users by total XP (all time).
+
+        Args:
+            limit: Maximum number of users to return
+            current_user_id: Optional user ID to include their rank even if not in top 50
+
+        Returns:
+            Dict with leaderboard entries and current user's rank
+        """
+        with self.get_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    WITH total_xp AS (
+                        SELECT
+                            up.user_id,
+                            COALESCE(up.full_name, 'User') as display_name,
+                            up.level,
+                            COALESCE(COUNT(s.session_id) * 10, 0) as total_xp
+                        FROM user_profiles up
+                        LEFT JOIN sessions s ON up.user_id = s.user_id AND s.state = 'completed'
+                        GROUP BY up.user_id, up.full_name, up.level
+                    ),
+                    ranked AS (
+                        SELECT
+                            user_id,
+                            display_name,
+                            total_xp,
+                            level,
+                            ROW_NUMBER() OVER (ORDER BY total_xp DESC, user_id) as rank
+                        FROM total_xp
+                        WHERE total_xp > 0
+                    )
+                    SELECT * FROM ranked
+                    WHERE rank <= %s
+                    ORDER BY rank
+                """, (limit,))
+                leaderboard = cur.fetchall()
+
+                current_user_rank = None
+                if current_user_id:
+                    cur.execute("""
+                        WITH total_xp AS (
+                            SELECT
+                                up.user_id,
+                                COALESCE(up.full_name, 'User') as display_name,
+                                up.level,
+                                COALESCE(COUNT(s.session_id) * 10, 0) as total_xp
+                            FROM user_profiles up
+                            LEFT JOIN sessions s ON up.user_id = s.user_id AND s.state = 'completed'
+                            GROUP BY up.user_id, up.full_name, up.level
+                        ),
+                        ranked AS (
+                            SELECT
+                                user_id,
+                                display_name,
+                                total_xp,
+                                level,
+                                ROW_NUMBER() OVER (ORDER BY total_xp DESC, user_id) as rank
+                            FROM total_xp
+                        )
+                        SELECT * FROM ranked WHERE user_id = %s
+                    """, (current_user_id,))
+                    current_user_rank = cur.fetchone()
+
+                return {
+                    "leaderboard": leaderboard,
+                    "current_user": current_user_rank
+                }
+
+    def get_streak_leaderboard(self, limit: int = 50, current_user_id: Optional[uuid.UUID] = None) -> Dict[str, Any]:
+        """
+        Get top users by current streak.
+
+        Args:
+            limit: Maximum number of users to return
+            current_user_id: Optional user ID to include their rank even if not in top 50
+
+        Returns:
+            Dict with leaderboard entries and current user's rank
+        """
+        with self.get_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    WITH streak_data AS (
+                        SELECT
+                            up.user_id,
+                            COALESCE(up.full_name, 'User') as display_name,
+                            up.level,
+                            COALESCE(us.current_streak_days, 0) as current_streak
+                        FROM user_profiles up
+                        LEFT JOIN user_streaks us ON up.user_id = us.user_id
+                    ),
+                    ranked AS (
+                        SELECT
+                            user_id,
+                            display_name,
+                            current_streak,
+                            level,
+                            ROW_NUMBER() OVER (ORDER BY current_streak DESC, user_id) as rank
+                        FROM streak_data
+                        WHERE current_streak > 0
+                    )
+                    SELECT * FROM ranked
+                    WHERE rank <= %s
+                    ORDER BY rank
+                """, (limit,))
+                leaderboard = cur.fetchall()
+
+                current_user_rank = None
+                if current_user_id:
+                    cur.execute("""
+                        WITH streak_data AS (
+                            SELECT
+                                up.user_id,
+                                COALESCE(up.full_name, 'User') as display_name,
+                                up.level,
+                                COALESCE(us.current_streak_days, 0) as current_streak
+                            FROM user_profiles up
+                            LEFT JOIN user_streaks us ON up.user_id = us.user_id
+                        ),
+                        ranked AS (
+                            SELECT
+                                user_id,
+                                display_name,
+                                current_streak,
+                                level,
+                                ROW_NUMBER() OVER (ORDER BY current_streak DESC, user_id) as rank
+                            FROM streak_data
+                        )
+                        SELECT * FROM ranked WHERE user_id = %s
+                    """, (current_user_id,))
+                    current_user_rank = cur.fetchone()
+
+                return {
+                    "leaderboard": leaderboard,
+                    "current_user": current_user_rank
+                }
+
     # Referrals
 
     def get_or_create_referral_code(self, user_id: uuid.UUID) -> Dict[str, Any]:
@@ -1008,6 +1366,586 @@ class Database:
                     SELECT * FROM get_weakest_skills(%s, %s)
                 """, (user_id, limit))
                 return cur.fetchall()
+
+    # Notifications
+
+    def create_notification(
+        self,
+        user_id: uuid.UUID,
+        notification_type: str,
+        title: str,
+        message: str,
+        action_url: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None
+    ) -> uuid.UUID:
+        """
+        Create a notification for a user.
+
+        Args:
+            user_id: User UUID
+            notification_type: Type of notification (streak_risk, achievement, goal_complete, etc.)
+            title: Notification title
+            message: Notification message
+            action_url: Optional URL to navigate to when clicked
+            metadata: Optional additional data
+
+        Returns:
+            Created notification UUID
+        """
+        with self.get_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    SELECT create_notification(%s, %s, %s, %s, %s, %s)
+                """, (
+                    user_id,
+                    notification_type,
+                    title,
+                    message,
+                    action_url,
+                    psycopg.types.json.Json(metadata or {})
+                ))
+                result = cur.fetchone()
+                return result['create_notification']
+
+    def get_notifications(
+        self,
+        user_id: uuid.UUID,
+        limit: int = 20,
+        offset: int = 0,
+        unread_only: bool = False
+    ) -> List[Dict[str, Any]]:
+        """
+        Get notifications for a user (paginated, unread first).
+
+        Args:
+            user_id: User UUID
+            limit: Maximum number of notifications to return
+            offset: Number of notifications to skip
+            unread_only: If True, only return unread notifications
+
+        Returns:
+            List of notification dicts
+        """
+        with self.get_connection() as conn:
+            with conn.cursor() as cur:
+                if unread_only:
+                    cur.execute("""
+                        SELECT * FROM user_notifications
+                        WHERE user_id = %s AND read = FALSE
+                        ORDER BY created_at DESC
+                        LIMIT %s OFFSET %s
+                    """, (user_id, limit, offset))
+                else:
+                    cur.execute("""
+                        SELECT * FROM user_notifications
+                        WHERE user_id = %s
+                        ORDER BY read ASC, created_at DESC
+                        LIMIT %s OFFSET %s
+                    """, (user_id, limit, offset))
+                return cur.fetchall()
+
+    def mark_notification_read(self, notification_id: uuid.UUID) -> bool:
+        """
+        Mark a notification as read.
+
+        Args:
+            notification_id: Notification UUID
+
+        Returns:
+            True if marked as read, False if not found or already read
+        """
+        with self.get_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    SELECT mark_notification_read(%s)
+                """, (notification_id,))
+                # Check if the notification exists
+                cur.execute("""
+                    SELECT 1 FROM user_notifications WHERE notification_id = %s
+                """, (notification_id,))
+                return cur.fetchone() is not None
+
+    def mark_all_notifications_read(self, user_id: uuid.UUID) -> int:
+        """
+        Mark all notifications as read for a user.
+
+        Args:
+            user_id: User UUID
+
+        Returns:
+            Number of notifications marked as read
+        """
+        with self.get_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    SELECT mark_all_notifications_read(%s)
+                """, (user_id,))
+                result = cur.fetchone()
+                return result['mark_all_notifications_read'] if result else 0
+
+    def get_unread_notification_count(self, user_id: uuid.UUID) -> int:
+        """
+        Get count of unread notifications for a user.
+
+        Args:
+            user_id: User UUID
+
+        Returns:
+            Number of unread notifications
+        """
+        with self.get_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    SELECT get_unread_notification_count(%s)
+                """, (user_id,))
+                result = cur.fetchone()
+                return result['get_unread_notification_count'] if result else 0
+
+    def notify_level_up(
+        self,
+        user_id: uuid.UUID,
+        old_level: str,
+        new_level: str
+    ) -> None:
+        """
+        Create a level up notification for a user.
+
+        Args:
+            user_id: User UUID
+            old_level: Previous CEFR level
+            new_level: New CEFR level
+        """
+        with self.get_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    SELECT notify_level_up(%s, %s, %s)
+                """, (user_id, old_level, new_level))
+
+    # Daily Challenges
+
+    def get_daily_challenge(self, challenge_date: Optional[datetime] = None) -> Dict[str, Any]:
+        """
+        Get the daily challenge for a specific date (defaults to today).
+        The same challenge is shown to all users for a given date.
+
+        Args:
+            challenge_date: Date for the challenge (defaults to today UTC)
+
+        Returns:
+            Daily challenge dict with type, description, goal, and reward_xp
+        """
+        if challenge_date is None:
+            challenge_date = datetime.utcnow().date()
+        elif isinstance(challenge_date, datetime):
+            challenge_date = challenge_date.date()
+
+        # Generate deterministic challenge based on date
+        # Use date as seed to ensure same challenge for all users on same day
+        import hashlib
+        date_str = challenge_date.isoformat()
+        hash_val = int(hashlib.md5(date_str.encode()).hexdigest(), 16)
+
+        # Define challenge types
+        challenges = [
+            {
+                "type": "complete_exercises",
+                "title": "Exercise Champion",
+                "description": "Complete 5 exercises today",
+                "goal": 5,
+                "reward_xp": 50,
+                "icon": "target"
+            },
+            {
+                "type": "correct_streak",
+                "title": "Perfect Streak",
+                "description": "Get 3 correct answers in a row",
+                "goal": 3,
+                "reward_xp": 40,
+                "icon": "zap"
+            },
+            {
+                "type": "study_time",
+                "title": "Time Master",
+                "description": "Practice for 10 minutes",
+                "goal": 10,
+                "reward_xp": 60,
+                "icon": "clock"
+            },
+            {
+                "type": "voice_tutor",
+                "title": "Speaking Star",
+                "description": "Try the voice tutor",
+                "goal": 1,
+                "reward_xp": 45,
+                "icon": "mic"
+            },
+            {
+                "type": "complete_reviews",
+                "title": "Review Master",
+                "description": "Complete 10 SRS card reviews",
+                "goal": 10,
+                "reward_xp": 50,
+                "icon": "book"
+            },
+            {
+                "type": "chat_turns",
+                "title": "Conversation King",
+                "description": "Have a 5-turn conversation with the AI tutor",
+                "goal": 5,
+                "reward_xp": 55,
+                "icon": "message"
+            },
+        ]
+
+        # Select challenge based on date hash
+        challenge = challenges[hash_val % len(challenges)]
+
+        return {
+            **challenge,
+            "date": date_str,
+            "expires_at": f"{date_str}T23:59:59Z"
+        }
+
+    def get_user_challenge_progress(
+        self,
+        user_id: uuid.UUID,
+        challenge_date: Optional[datetime] = None
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Get user's progress on today's challenge.
+
+        Args:
+            user_id: User UUID
+            challenge_date: Date for the challenge (defaults to today UTC)
+
+        Returns:
+            Challenge progress dict or None if not started
+        """
+        if challenge_date is None:
+            challenge_date = datetime.utcnow().date()
+        elif isinstance(challenge_date, datetime):
+            challenge_date = challenge_date.date()
+
+        with self.get_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    SELECT * FROM daily_challenge_progress
+                    WHERE user_id = %s AND challenge_date = %s
+                """, (user_id, challenge_date))
+                return cur.fetchone()
+
+    def update_challenge_progress(
+        self,
+        user_id: uuid.UUID,
+        challenge_type: str,
+        progress: int,
+        challenge_date: Optional[datetime] = None
+    ) -> Dict[str, Any]:
+        """
+        Update user's progress on daily challenge.
+
+        Args:
+            user_id: User UUID
+            challenge_type: Type of challenge
+            progress: Current progress value
+            challenge_date: Date for the challenge (defaults to today UTC)
+
+        Returns:
+            Updated challenge progress dict
+        """
+        if challenge_date is None:
+            challenge_date = datetime.utcnow().date()
+        elif isinstance(challenge_date, datetime):
+            challenge_date = challenge_date.date()
+
+        # Get the challenge definition
+        challenge = self.get_daily_challenge(challenge_date)
+
+        # Check if this is the right challenge type for today
+        if challenge["type"] != challenge_type:
+            # Wrong challenge type for today, don't update
+            return self.get_user_challenge_progress(user_id, challenge_date) or {}
+
+        goal = challenge["goal"]
+        completed = progress >= goal
+
+        with self.get_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    INSERT INTO daily_challenge_progress (
+                        user_id, challenge_date, challenge_type, progress, goal, completed
+                    )
+                    VALUES (%s, %s, %s, %s, %s, %s)
+                    ON CONFLICT (user_id, challenge_date)
+                    DO UPDATE SET
+                        progress = GREATEST(daily_challenge_progress.progress, EXCLUDED.progress),
+                        completed = (GREATEST(daily_challenge_progress.progress, EXCLUDED.progress) >= EXCLUDED.goal),
+                        updated_at = NOW()
+                    RETURNING *
+                """, (user_id, challenge_date, challenge_type, progress, goal, completed))
+                return cur.fetchone()
+
+    def complete_daily_challenge(
+        self,
+        user_id: uuid.UUID,
+        challenge_date: Optional[datetime] = None
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Mark daily challenge as complete and award bonus XP.
+
+        Args:
+            user_id: User UUID
+            challenge_date: Date for the challenge (defaults to today UTC)
+
+        Returns:
+            Completed challenge record or None if already completed
+        """
+        if challenge_date is None:
+            challenge_date = datetime.utcnow().date()
+        elif isinstance(challenge_date, datetime):
+            challenge_date = challenge_date.date()
+
+        with self.get_connection() as conn:
+            with conn.cursor() as cur:
+                # Check if already completed
+                cur.execute("""
+                    SELECT completed FROM daily_challenge_progress
+                    WHERE user_id = %s AND challenge_date = %s
+                """, (user_id, challenge_date))
+                result = cur.fetchone()
+
+                if result and result['completed']:
+                    return None  # Already completed
+
+                # Mark as complete
+                cur.execute("""
+                    UPDATE daily_challenge_progress
+                    SET completed = TRUE, completed_at = NOW(), updated_at = NOW()
+                    WHERE user_id = %s AND challenge_date = %s AND progress >= goal
+                    RETURNING *
+                """, (user_id, challenge_date))
+
+                return cur.fetchone()
+
+    def get_challenge_history(
+        self,
+        user_id: uuid.UUID,
+        limit: int = 30
+    ) -> List[Dict[str, Any]]:
+        """
+        Get user's challenge completion history.
+
+        Args:
+            user_id: User UUID
+            limit: Maximum number of records to return
+
+        Returns:
+            List of challenge progress records
+        """
+        with self.get_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    SELECT * FROM daily_challenge_progress
+                    WHERE user_id = %s
+                    ORDER BY challenge_date DESC
+                    LIMIT %s
+                """, (user_id, limit))
+                return cur.fetchall()
+
+    def get_challenge_streak(self, user_id: uuid.UUID) -> int:
+        """
+        Get user's current daily challenge completion streak.
+
+        Args:
+            user_id: User UUID
+
+        Returns:
+            Number of consecutive days with completed challenges
+        """
+        with self.get_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    WITH RECURSIVE date_series AS (
+                        SELECT CURRENT_DATE as check_date, 0 as days_back
+                        UNION ALL
+                        SELECT check_date - 1, days_back + 1
+                        FROM date_series
+                        WHERE days_back < 365
+                    )
+                    SELECT COUNT(*) as streak
+                    FROM date_series ds
+                    LEFT JOIN daily_challenge_progress dcp
+                        ON dcp.user_id = %s
+                        AND dcp.challenge_date = ds.check_date
+                        AND dcp.completed = TRUE
+                    WHERE ds.check_date <= CURRENT_DATE
+                        AND dcp.completed IS NOT NULL
+                        AND NOT EXISTS (
+                            SELECT 1 FROM date_series ds2
+                            LEFT JOIN daily_challenge_progress dcp2
+                                ON dcp2.user_id = %s
+                                AND dcp2.challenge_date = ds2.check_date
+                                AND dcp2.completed = TRUE
+                            WHERE ds2.check_date > ds.check_date
+                                AND ds2.check_date <= CURRENT_DATE
+                                AND dcp2.completed IS NULL
+                        )
+                """, (user_id, user_id))
+                result = cur.fetchone()
+                return result['streak'] if result else 0
+
+    # Conversation Memory
+
+    def save_conversation_turn(
+        self,
+        user_id: uuid.UUID,
+        session_id: uuid.UUID,
+        turn_number: int,
+        user_message: str,
+        tutor_response: str,
+        context_type: Optional[str] = None,
+        context_id: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None
+    ) -> uuid.UUID:
+        """
+        Save a conversation turn to the database.
+
+        Args:
+            user_id: User UUID
+            session_id: Session UUID
+            turn_number: Sequential turn number in the session
+            user_message: User's message text
+            tutor_response: Tutor's response text
+            context_type: Type of context (scenario, lesson, free_chat, etc.)
+            context_id: ID of the specific context (scenario_id, lesson_id, etc.)
+            metadata: Additional metadata (errors, topics, etc.)
+
+        Returns:
+            Created conversation UUID
+        """
+        with self.get_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    SELECT save_conversation_turn(%s, %s, %s, %s, %s, %s, %s, %s)
+                """, (
+                    user_id,
+                    session_id,
+                    turn_number,
+                    user_message,
+                    tutor_response,
+                    context_type,
+                    context_id,
+                    psycopg.types.json.Json(metadata or {})
+                ))
+                result = cur.fetchone()
+                return result['save_conversation_turn']
+
+    def get_recent_conversations(
+        self,
+        user_id: uuid.UUID,
+        limit: int = 10
+    ) -> List[Dict[str, Any]]:
+        """
+        Get recent conversation turns for a user.
+
+        Args:
+            user_id: User UUID
+            limit: Maximum number of turns to return
+
+        Returns:
+            List of conversation turn dicts
+        """
+        with self.get_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    SELECT * FROM get_recent_conversations(%s, %s)
+                """, (user_id, limit))
+                return cur.fetchall()
+
+    def get_conversation_context(
+        self,
+        user_id: uuid.UUID,
+        lookback_days: int = 7,
+        limit: int = 20
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Get conversation context summary for a user.
+
+        Provides summary of recent conversations including:
+        - Total conversation count
+        - Recent topics/contexts
+        - Most active context type
+
+        Args:
+            user_id: User UUID
+            lookback_days: Number of days to look back
+            limit: Limit for recent conversations
+
+        Returns:
+            Context summary dict or None
+        """
+        with self.get_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    SELECT * FROM get_conversation_context(%s, %s, %s)
+                """, (user_id, lookback_days, limit))
+                result = cur.fetchone()
+                if result:
+                    return {
+                        "total_conversations": result['total_conversations'],
+                        "recent_topics": result['recent_topics'],
+                        "context_summary": result['context_summary']
+                    }
+                return None
+
+    def get_conversation_by_context(
+        self,
+        user_id: uuid.UUID,
+        context_type: str,
+        context_id: Optional[str] = None,
+        limit: int = 50
+    ) -> List[Dict[str, Any]]:
+        """
+        Get conversations filtered by context type and optional context ID.
+
+        Args:
+            user_id: User UUID
+            context_type: Context type (scenario, lesson, free_chat, etc.)
+            context_id: Optional specific context ID
+            limit: Maximum number of turns to return
+
+        Returns:
+            List of conversation turn dicts
+        """
+        with self.get_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    SELECT * FROM get_conversation_by_context(%s, %s, %s, %s)
+                """, (user_id, context_type, context_id, limit))
+                return cur.fetchall()
+
+    def clear_conversation_history(
+        self,
+        user_id: uuid.UUID,
+        before_date: Optional[datetime] = None
+    ) -> int:
+        """
+        Clear conversation history for a user.
+
+        Args:
+            user_id: User UUID
+            before_date: Optional date - only clear conversations before this date
+
+        Returns:
+            Number of conversations deleted
+        """
+        with self.get_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    SELECT clear_conversation_history(%s, %s)
+                """, (user_id, before_date))
+                result = cur.fetchone()
+                return result['clear_conversation_history'] if result else 0
 
     # Health Check
 

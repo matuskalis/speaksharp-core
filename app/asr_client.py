@@ -124,15 +124,30 @@ class ASRClient:
                 file=audio_file,
                 language=self.config.language,
                 response_format="verbose_json",
+                timestamp_granularities=["word"],
                 timeout=self.config.timeout
             )
+
+        # Extract word-level timestamps if available
+        words = None
+        if hasattr(response, 'words') and response.words:
+            from app.models import WordTiming
+            words = [
+                WordTiming(
+                    word=w.word,
+                    start=w.start,
+                    end=w.end,
+                    confidence=getattr(w, 'confidence', None)
+                )
+                for w in response.words
+            ]
 
         return ASRResult(
             text=response.text,
             confidence=None,  # Whisper doesn't provide overall confidence
             language=response.language if hasattr(response, 'language') else self.config.language,
             duration=response.duration if hasattr(response, 'duration') else None,
-            words=None,  # Could parse segments if needed
+            words=words,
             provider="openai"
         )
 
@@ -159,6 +174,7 @@ class ASRClient:
                 file=audio_file,
                 language=self.config.language,
                 response_format="verbose_json",
+                timestamp_granularities=["word"],
                 timeout=self.config.timeout
             )
         except Exception as e:
@@ -174,12 +190,26 @@ class ASRClient:
         elif config.log_api_calls:
             print(f"[{datetime.now()}] Whisper response text: '{response.text}' ({len(response.text)} chars)")
 
+        # Extract word-level timestamps if available
+        words = None
+        if hasattr(response, 'words') and response.words:
+            from app.models import WordTiming
+            words = [
+                WordTiming(
+                    word=w.word,
+                    start=w.start,
+                    end=w.end,
+                    confidence=getattr(w, 'confidence', None)
+                )
+                for w in response.words
+            ]
+
         return ASRResult(
             text=response.text,
             confidence=None,  # Whisper doesn't provide overall confidence
             language=response.language if hasattr(response, 'language') else self.config.language,
             duration=response.duration if hasattr(response, 'duration') else None,
-            words=None,  # Could parse segments if needed
+            words=words,
             provider="openai"
         )
 
