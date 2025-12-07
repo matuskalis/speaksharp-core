@@ -2173,6 +2173,181 @@ async def submit_placement_test(
     }
 
 
+# Adaptive Placement Test Session Storage (in-memory for simplicity)
+# In production, this should use Redis or database
+_adaptive_test_sessions: Dict[str, Any] = {}
+
+
+@app.post("/api/placement-test/adaptive/start", tags=["Placement Test"])
+async def start_adaptive_placement_test():
+    """
+    Start a new adaptive placement test session.
+
+    Returns the first question and a session_id to track the test.
+    The test starts at B1 level and adapts based on performance.
+    """
+    from app.placement_test import adaptive_placement_test
+    import uuid as uuid_module
+
+    # Generate session ID
+    session_id = str(uuid_module.uuid4())
+
+    # Start the test
+    state = adaptive_placement_test.start_test(session_id)
+
+    # Get first question
+    question = adaptive_placement_test.get_next_question(state)
+
+    if not question:
+        raise HTTPException(status_code=500, detail="Failed to generate question")
+
+    # Store state
+    _adaptive_test_sessions[session_id] = state.model_dump()
+
+    return {
+        "session_id": session_id,
+        "question": {
+            "question_id": question.question_id,
+            "question_text": question.question_text,
+            "options": question.options,
+            "level": question.level,
+            "skill_type": question.skill_type,
+        },
+        "question_number": 1,
+        "is_complete": False,
+    }
+
+
+@app.post("/api/placement-test/adaptive/answer", tags=["Placement Test"])
+async def submit_adaptive_answer(
+    payload: dict,
+    db: Database = Depends(get_database),
+    user_id_from_token: Optional[str] = Depends(optional_verify_token),
+):
+    """
+    Submit an answer for the current question and get the next one.
+
+    Payload:
+    {
+        "session_id": "uuid",
+        "question_id": "a1_grammar_1",
+        "answer": 0  // Index of selected option
+    }
+
+    Returns the next question or final results if test is complete.
+    """
+    from app.placement_test import adaptive_placement_test, AdaptiveTestState, PLACEMENT_QUESTIONS
+
+    session_id = payload.get("session_id")
+    question_id = payload.get("question_id")
+    answer = payload.get("answer")
+
+    if not session_id or question_id is None or answer is None:
+        raise HTTPException(status_code=400, detail="Missing required fields")
+
+    # Get session state
+    state_dict = _adaptive_test_sessions.get(session_id)
+    if not state_dict:
+        raise HTTPException(status_code=404, detail="Session not found")
+
+    state = AdaptiveTestState(**state_dict)
+
+    # Find the question
+    question = next((q for q in PLACEMENT_QUESTIONS if q.question_id == question_id), None)
+    if not question:
+        raise HTTPException(status_code=400, detail="Invalid question_id")
+
+    # Process the answer
+    state = adaptive_placement_test.process_answer(state, question, answer)
+
+    # Check if answer was correct (for frontend feedback)
+    is_correct = answer == question.correct_answer
+
+    # Update stored state
+    _adaptive_test_sessions[session_id] = state.model_dump()
+
+    if state.is_complete:
+        # Test is complete - return final results
+        result = adaptive_placement_test.evaluate_test(state)
+
+        # Update user's level in database if authenticated
+        if user_id_from_token:
+            try:
+                user_id = uuid.UUID(user_id_from_token)
+                db.update_user_profile(
+                    user_id=user_id,
+                    level=result.level
+                )
+            except Exception as e:
+                print(f"Warning: Failed to update user profile: {e}")
+
+        # Clean up session
+        del _adaptive_test_sessions[session_id]
+
+        return {
+            "is_complete": True,
+            "answer_correct": is_correct,
+            "correct_answer": question.correct_answer,
+            "explanation": question.explanation,
+            "result": {
+                "level": result.level,
+                "score": result.score,
+                "total_questions": result.total_questions,
+                "strengths": result.strengths,
+                "weaknesses": result.weaknesses,
+                "recommendation": result.recommendation,
+            }
+        }
+    else:
+        # Get next question
+        next_question = adaptive_placement_test.get_next_question(state)
+
+        if not next_question:
+            # Edge case: no more questions but test not marked complete
+            state.is_complete = True
+            result = adaptive_placement_test.evaluate_test(state)
+
+            if user_id_from_token:
+                try:
+                    user_id = uuid.UUID(user_id_from_token)
+                    db.update_user_profile(user_id=user_id, level=result.level)
+                except Exception:
+                    pass
+
+            del _adaptive_test_sessions[session_id]
+
+            return {
+                "is_complete": True,
+                "answer_correct": is_correct,
+                "correct_answer": question.correct_answer,
+                "explanation": question.explanation,
+                "result": {
+                    "level": result.level,
+                    "score": result.score,
+                    "total_questions": result.total_questions,
+                    "strengths": result.strengths,
+                    "weaknesses": result.weaknesses,
+                    "recommendation": result.recommendation,
+                }
+            }
+
+        return {
+            "is_complete": False,
+            "answer_correct": is_correct,
+            "correct_answer": question.correct_answer,
+            "explanation": question.explanation,
+            "current_level": state.current_level,
+            "question_number": len(state.answers) + 1,
+            "question": {
+                "question_id": next_question.question_id,
+                "question_text": next_question.question_text,
+                "options": next_question.options,
+                "level": next_question.level,
+                "skill_type": next_question.skill_type,
+            }
+        }
+
+
 # ============================================================================
 # Learning Dashboard Endpoint
 # ============================================================================
