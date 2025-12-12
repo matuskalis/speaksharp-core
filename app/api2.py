@@ -35,10 +35,13 @@ from app.diagnostic import (
 from app.exercises import EXERCISES, get_exercises_by_skill_key
 from app.thinking_engine import thinking_engine, ThinkingSession, ThinkingTurn
 from app.asr_client import asr_client
+from app.tts_client import tts_client
 import random
+import io
 import time
 import tempfile
 import os
+import httpx
 
 # Simple in-memory cache to prevent XP abuse (prevents re-submission of same exercise)
 # Key: "user_id:exercise_id", Value: timestamp of correct answer
@@ -1049,12 +1052,14 @@ def build_rich_tutor_context(
     turn_number: int = 1,
 ) -> dict:
     """
-    Build rich context for the AI tutor including user profile, errors, and skills.
+    Build rich context for the AI tutor including user profile, errors, skills,
+    and CURRENT SESSION conversation history.
 
     This context helps the AI personalize feedback based on:
     - User's level, goals, interests, native language
     - Recent error patterns (to address recurring mistakes)
     - Weak skills (to focus corrections)
+    - Current session conversation history (for continuity within the session)
     """
     # Base context
     context = {
@@ -1072,6 +1077,28 @@ def build_rich_tutor_context(
     context["native_language"] = user.get('native_language')
     context["goals"] = user.get('goals', [])
     context["interests"] = user.get('interests', [])
+
+    # CRITICAL: Load current session conversation history
+    # This ensures the AI remembers what was said in THIS conversation
+    if session_id:
+        try:
+            session_conversations = db.get_session_conversations(session_id, limit=20)
+            if session_conversations:
+                # Build conversation history for the LLM
+                # Uses field names that llm_client.py expects
+                conversation_summary = []
+                for conv in session_conversations:
+                    conversation_summary.append({
+                        "user_said": conv.get('user_message', ''),
+                        "tutor_said": conv.get('tutor_response', ''),
+                    })
+                context["recent_conversation_summary"] = conversation_summary
+                context["has_conversation_history"] = True
+                context["recent_conversation_count"] = len(session_conversations)
+        except Exception as e:
+            print(f"Warning: Failed to load session conversations: {e}")
+            context["recent_conversation_summary"] = []
+            context["has_conversation_history"] = False
 
     # Recent errors (last 10) - helps identify recurring patterns
     try:
@@ -7309,6 +7336,94 @@ async def transcribe_speech(
         raise HTTPException(status_code=500, detail=f"Transcription failed: {str(e)}")
 
 
+@app.post("/api/realtime-token")
+async def get_realtime_token(
+    user_id_from_token: str = Depends(verify_token)
+):
+    """
+    Generate an ephemeral OpenAI Realtime API token for client-side WebSocket connection.
+
+    This endpoint creates a short-lived session with OpenAI's Realtime API and returns
+    an ephemeral client secret that the mobile app uses to connect directly to OpenAI's
+    WebSocket for low-latency speech-to-speech conversations.
+
+    The token is valid for 60 seconds and allows direct client connection without
+    proxying audio through our backend.
+
+    Returns:
+        - client_secret: Ephemeral token for WebSocket authentication
+        - expires_at: Unix timestamp when the token expires
+        - session_id: OpenAI session ID for debugging
+    """
+    openai_api_key = os.getenv("OPENAI_API_KEY")
+    if not openai_api_key:
+        raise HTTPException(status_code=500, detail="OpenAI API key not configured")
+
+    try:
+        async with httpx.AsyncClient() as client:
+            response = await client.post(
+                "https://api.openai.com/v1/realtime/sessions",
+                headers={
+                    "Authorization": f"Bearer {openai_api_key}",
+                    "Content-Type": "application/json",
+                },
+                json={
+                    "model": "gpt-4o-realtime-preview-2024-12-17",
+                    "voice": "alloy",
+                    "instructions": """You are a friendly and encouraging English language tutor helping non-native speakers practice conversational English.
+
+Your role:
+- Have natural, flowing conversations to help users practice speaking
+- Speak clearly and at a moderate pace
+- Gently correct pronunciation and grammar mistakes
+- Provide encouraging feedback
+- Ask follow-up questions to keep the conversation going
+- Adapt your vocabulary to the user's level
+
+Keep responses conversational and concise (2-4 sentences typically).
+If the user makes errors, briefly note the correction, then continue the conversation naturally.""",
+                    "turn_detection": {
+                        "type": "server_vad",
+                        "threshold": 0.5,
+                        "prefix_padding_ms": 300,
+                        "silence_duration_ms": 500
+                    },
+                    "input_audio_transcription": {
+                        "model": "whisper-1"
+                    }
+                },
+                timeout=10.0
+            )
+
+            if response.status_code != 200:
+                error_detail = response.text
+                print(f"OpenAI Realtime API error: {response.status_code} - {error_detail}")
+                raise HTTPException(
+                    status_code=502,
+                    detail=f"Failed to create realtime session: {error_detail}"
+                )
+
+            data = response.json()
+
+            return {
+                "success": True,
+                "client_secret": data.get("client_secret", {}).get("value"),
+                "expires_at": data.get("client_secret", {}).get("expires_at"),
+                "session_id": data.get("id"),
+                "model": data.get("model"),
+                "voice": data.get("voice")
+            }
+
+    except httpx.TimeoutException:
+        raise HTTPException(status_code=504, detail="OpenAI API timeout")
+    except httpx.RequestError as e:
+        print(f"Realtime token request error: {e}")
+        raise HTTPException(status_code=502, detail=f"Failed to connect to OpenAI: {str(e)}")
+    except Exception as e:
+        print(f"Realtime token error: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to generate realtime token: {str(e)}")
+
+
 @app.post("/api/speech/analyze")
 async def analyze_speech(
     audio: UploadFile = File(...),
@@ -7406,6 +7521,54 @@ async def analyze_speech(
     except Exception as e:
         print(f"Speech analysis error: {e}")
         raise HTTPException(status_code=500, detail=f"Speech analysis failed: {str(e)}")
+
+
+class TTSSynthesizeRequest(BaseModel):
+    """Request body for TTS synthesis."""
+    text: str = Field(..., description="Text to synthesize to speech")
+    voice: Optional[str] = Field(None, description="Voice to use (alloy, echo, fable, onyx, nova, shimmer)")
+
+
+@app.post("/api/speech/synthesize")
+async def synthesize_speech(
+    request: TTSSynthesizeRequest,
+    user_id_from_token: str = Depends(verify_token)
+):
+    """
+    Synthesize text to speech using OpenAI TTS.
+
+    Returns MP3 audio data that can be played directly.
+    Uses natural-sounding voices for authentic conversation experience.
+    """
+    try:
+        if not request.text or not request.text.strip():
+            raise HTTPException(status_code=400, detail="Text is required")
+
+        # Limit text length to prevent abuse
+        text = request.text.strip()[:1000]
+
+        # Synthesize using OpenAI TTS
+        result = tts_client.synthesize_to_bytes(text)
+
+        if result.audio_bytes is None:
+            raise HTTPException(status_code=500, detail="TTS synthesis failed - no audio generated")
+
+        # Return audio as streaming response
+        return StreamingResponse(
+            io.BytesIO(result.audio_bytes),
+            media_type="audio/mpeg",
+            headers={
+                "Content-Disposition": "inline; filename=speech.mp3",
+                "X-TTS-Provider": result.provider,
+                "X-TTS-Characters": str(result.characters)
+            }
+        )
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"TTS synthesis error: {e}")
+        raise HTTPException(status_code=500, detail=f"TTS synthesis failed: {str(e)}")
 
 
 if __name__ == "__main__":
