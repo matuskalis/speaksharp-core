@@ -1947,6 +1947,961 @@ class Database:
                 result = cur.fetchone()
                 return result['clear_conversation_history'] if result else 0
 
+    # Daily Challenges
+
+    def get_daily_challenges(self, user_id: uuid.UUID) -> Optional[Dict[str, Any]]:
+        """
+        Get or create today's daily challenges for a user.
+
+        Args:
+            user_id: User UUID
+
+        Returns:
+            Daily challenges dict with all 3 challenges and their progress
+        """
+        with self.get_connection() as conn:
+            with conn.cursor() as cur:
+                # Try to get existing challenges for today
+                cur.execute("""
+                    SELECT * FROM daily_challenges
+                    WHERE user_id = %s AND challenge_date = CURRENT_DATE
+                """, (user_id,))
+                result = cur.fetchone()
+
+                # If no challenges exist, create them
+                if not result:
+                    cur.execute("""
+                        INSERT INTO daily_challenges (user_id, challenge_date)
+                        VALUES (%s, CURRENT_DATE)
+                        ON CONFLICT (user_id, challenge_date) DO NOTHING
+                        RETURNING *
+                    """, (user_id,))
+                    result = cur.fetchone()
+
+                    # Fetch again if INSERT didn't return (concurrent insert)
+                    if not result:
+                        cur.execute("""
+                            SELECT * FROM daily_challenges
+                            WHERE user_id = %s AND challenge_date = CURRENT_DATE
+                        """, (user_id,))
+                        result = cur.fetchone()
+
+                return dict(result) if result else None
+
+    def update_daily_challenge_progress(
+        self,
+        user_id: uuid.UUID,
+        lessons_completed: int = 0,
+        best_score: int = 0,
+        xp_earned: int = 0,
+        speaking_sessions: int = 0
+    ) -> Dict[str, Any]:
+        """
+        Update daily challenge progress and check for completions.
+
+        Args:
+            user_id: User UUID
+            lessons_completed: Number of lessons completed this update
+            best_score: Best score achieved this update
+            xp_earned: XP earned this update
+            speaking_sessions: Number of speaking sessions this update
+
+        Returns:
+            Dict with completion status and rewards
+        """
+        with self.get_connection() as conn:
+            with conn.cursor() as cur:
+                # Ensure today's challenges exist
+                cur.execute("""
+                    INSERT INTO daily_challenges (user_id, challenge_date)
+                    VALUES (%s, CURRENT_DATE)
+                    ON CONFLICT (user_id, challenge_date) DO NOTHING
+                """, (user_id,))
+
+                # Get current state
+                cur.execute("""
+                    SELECT * FROM daily_challenges
+                    WHERE user_id = %s AND challenge_date = CURRENT_DATE
+                """, (user_id,))
+                challenge = cur.fetchone()
+
+                if not challenge:
+                    return {"error": "Could not find or create daily challenges"}
+
+                result = {
+                    "core_just_completed": False,
+                    "accuracy_just_completed": False,
+                    "stretch_just_completed": False,
+                    "total_xp_earned": 0,
+                    "earned_freeze_token": False
+                }
+
+                # Update Core Challenge (lessons completed)
+                if not challenge['core_completed'] and lessons_completed > 0:
+                    new_progress = challenge['core_progress'] + lessons_completed
+                    cur.execute("""
+                        UPDATE daily_challenges
+                        SET core_progress = %s, updated_at = NOW()
+                        WHERE id = %s
+                    """, (new_progress, challenge['id']))
+
+                    if new_progress >= challenge['core_target']:
+                        cur.execute("""
+                            UPDATE daily_challenges
+                            SET core_completed = TRUE, core_completed_at = NOW()
+                            WHERE id = %s
+                        """, (challenge['id'],))
+                        result['core_just_completed'] = True
+                        result['total_xp_earned'] += challenge['core_xp_reward']
+
+                # Update Accuracy Challenge (best score)
+                if not challenge['accuracy_completed'] and best_score > 0:
+                    new_progress = max(challenge['accuracy_progress'], best_score)
+                    cur.execute("""
+                        UPDATE daily_challenges
+                        SET accuracy_progress = %s, updated_at = NOW()
+                        WHERE id = %s
+                    """, (new_progress, challenge['id']))
+
+                    if best_score >= challenge['accuracy_target']:
+                        cur.execute("""
+                            UPDATE daily_challenges
+                            SET accuracy_completed = TRUE, accuracy_completed_at = NOW()
+                            WHERE id = %s
+                        """, (challenge['id'],))
+                        result['accuracy_just_completed'] = True
+                        result['total_xp_earned'] += challenge['accuracy_xp_reward']
+
+                # Update Stretch Challenge (XP or speaking)
+                if not challenge['stretch_completed']:
+                    new_xp_progress = challenge['stretch_xp_progress'] + xp_earned
+                    new_speaking_progress = challenge['stretch_speaking_progress'] + speaking_sessions
+                    cur.execute("""
+                        UPDATE daily_challenges
+                        SET stretch_xp_progress = %s, stretch_speaking_progress = %s, updated_at = NOW()
+                        WHERE id = %s
+                    """, (new_xp_progress, new_speaking_progress, challenge['id']))
+
+                    if new_xp_progress >= challenge['stretch_xp_target'] or \
+                       new_speaking_progress >= challenge['stretch_speaking_target']:
+                        cur.execute("""
+                            UPDATE daily_challenges
+                            SET stretch_completed = TRUE, stretch_completed_at = NOW()
+                            WHERE id = %s
+                        """, (challenge['id'],))
+                        result['stretch_just_completed'] = True
+                        result['total_xp_earned'] += challenge['stretch_xp_reward']
+
+                        # Grant streak freeze token
+                        if challenge['stretch_gives_freeze_token']:
+                            cur.execute("""
+                                INSERT INTO streak_freeze_tokens (user_id)
+                                VALUES (%s)
+                            """, (user_id,))
+                            result['earned_freeze_token'] = True
+
+                # Check if all completed
+                cur.execute("""
+                    UPDATE daily_challenges
+                    SET all_completed = (core_completed AND accuracy_completed AND stretch_completed)
+                    WHERE id = %s
+                """, (challenge['id'],))
+
+                return result
+
+    def get_streak_freeze_count(self, user_id: uuid.UUID) -> int:
+        """
+        Get number of available streak freeze tokens for a user.
+
+        Args:
+            user_id: User UUID
+
+        Returns:
+            Number of unused freeze tokens
+        """
+        with self.get_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    SELECT COUNT(*) as count FROM streak_freeze_tokens
+                    WHERE user_id = %s AND used = FALSE
+                """, (user_id,))
+                result = cur.fetchone()
+                return result['count'] if result else 0
+
+    def use_streak_freeze_token(self, user_id: uuid.UUID) -> bool:
+        """
+        Use a streak freeze token.
+
+        Args:
+            user_id: User UUID
+
+        Returns:
+            True if a token was used, False if no tokens available
+        """
+        with self.get_connection() as conn:
+            with conn.cursor() as cur:
+                # Find the oldest unused token
+                cur.execute("""
+                    SELECT id FROM streak_freeze_tokens
+                    WHERE user_id = %s AND used = FALSE
+                    ORDER BY earned_at ASC
+                    LIMIT 1
+                """, (user_id,))
+                result = cur.fetchone()
+
+                if not result:
+                    return False
+
+                # Mark it as used
+                cur.execute("""
+                    UPDATE streak_freeze_tokens
+                    SET used = TRUE, used_at = NOW()
+                    WHERE id = %s
+                """, (result['id'],))
+
+                return True
+
+    # ============================================================================
+    # Friends System Methods
+    # ============================================================================
+
+    def get_user_friend_code(self, user_id: uuid.UUID) -> str:
+        """
+        Get or create friend code for a user.
+
+        Args:
+            user_id: User UUID
+
+        Returns:
+            8-character friend code
+        """
+        with self.get_connection() as conn:
+            with conn.cursor() as cur:
+                # Check if user already has a code
+                cur.execute("SELECT friend_code FROM user_profiles WHERE user_id = %s", (user_id,))
+                result = cur.fetchone()
+
+                if result and result['friend_code']:
+                    return result['friend_code']
+
+                # Generate new code
+                chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789'
+                import random
+                while True:
+                    code = ''.join(random.choice(chars) for _ in range(8))
+                    try:
+                        cur.execute("""
+                            UPDATE user_profiles SET friend_code = %s WHERE user_id = %s
+                        """, (code, user_id))
+                        return code
+                    except Exception:
+                        # Code collision, try again
+                        continue
+
+    def search_users(self, searcher_id: uuid.UUID, query: str, limit: int = 10) -> List[Dict[str, Any]]:
+        """
+        Search users by username, display name, or friend code.
+
+        Args:
+            searcher_id: ID of user performing search
+            query: Search query
+            limit: Max results
+
+        Returns:
+            List of matching users with friendship status
+        """
+        with self.get_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    SELECT
+                        up.user_id,
+                        up.username,
+                        up.display_name,
+                        up.friend_code,
+                        up.level,
+                        up.total_xp,
+                        COALESCE(us.streak_days, 0) as streak_days,
+                        EXISTS(
+                            SELECT 1 FROM friendships f
+                            WHERE ((f.user_id = %s AND f.friend_id = up.user_id)
+                               OR (f.friend_id = %s AND f.user_id = up.user_id))
+                              AND f.status = 'accepted'
+                        ) as is_friend,
+                        (
+                            SELECT f.status FROM friendships f
+                            WHERE (f.user_id = %s AND f.friend_id = up.user_id)
+                               OR (f.friend_id = %s AND f.user_id = up.user_id)
+                            LIMIT 1
+                        ) as friendship_status
+                    FROM user_profiles up
+                    LEFT JOIN user_streaks us ON us.user_id = up.user_id
+                    WHERE up.user_id != %s
+                      AND (
+                        LOWER(up.username) LIKE LOWER(%s)
+                        OR LOWER(up.display_name) LIKE LOWER(%s)
+                        OR UPPER(up.friend_code) = UPPER(%s)
+                      )
+                    ORDER BY
+                        CASE WHEN UPPER(up.friend_code) = UPPER(%s) THEN 0 ELSE 1 END,
+                        CASE WHEN LOWER(up.username) = LOWER(%s) THEN 0 ELSE 1 END,
+                        up.total_xp DESC
+                    LIMIT %s
+                """, (
+                    searcher_id, searcher_id, searcher_id, searcher_id, searcher_id,
+                    query + '%', '%' + query + '%', query,
+                    query, query, limit
+                ))
+                return [dict(row) for row in cur.fetchall()]
+
+    def get_friends_list(self, user_id: uuid.UUID) -> List[Dict[str, Any]]:
+        """
+        Get list of friends with their today's stats.
+
+        Args:
+            user_id: User UUID
+
+        Returns:
+            List of friends with XP and lesson counts
+        """
+        with self.get_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    SELECT
+                        up.user_id,
+                        up.username,
+                        up.display_name,
+                        up.level,
+                        up.total_xp,
+                        COALESCE(us.streak_days, 0) as streak_days,
+                        COALESCE(
+                            (SELECT SUM(xp_earned)::INTEGER FROM xp_transactions
+                             WHERE xp_transactions.user_id = up.user_id AND DATE(created_at) = CURRENT_DATE),
+                            0
+                        ) as xp_today,
+                        COALESCE(
+                            (SELECT COUNT(*)::INTEGER FROM learning_path_progress
+                             WHERE learning_path_progress.user_id = up.user_id
+                               AND DATE(completed_at) = CURRENT_DATE AND completed = TRUE),
+                            0
+                        ) as lessons_today,
+                        f.accepted_at as friend_since
+                    FROM friendships f
+                    JOIN user_profiles up ON (
+                        CASE WHEN f.user_id = %s THEN f.friend_id ELSE f.user_id END = up.user_id
+                    )
+                    LEFT JOIN user_streaks us ON us.user_id = up.user_id
+                    WHERE (f.user_id = %s OR f.friend_id = %s)
+                      AND f.status = 'accepted'
+                    ORDER BY xp_today DESC, up.total_xp DESC
+                """, (user_id, user_id, user_id))
+                return [dict(row) for row in cur.fetchall()]
+
+    def get_pending_friend_requests(self, user_id: uuid.UUID) -> List[Dict[str, Any]]:
+        """
+        Get pending friend requests received by user.
+
+        Args:
+            user_id: User UUID
+
+        Returns:
+            List of pending requests
+        """
+        with self.get_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    SELECT
+                        f.id as request_id,
+                        up.user_id,
+                        up.username,
+                        up.display_name,
+                        up.level,
+                        up.total_xp,
+                        f.created_at as requested_at
+                    FROM friendships f
+                    JOIN user_profiles up ON f.user_id = up.user_id
+                    WHERE f.friend_id = %s AND f.status = 'pending'
+                    ORDER BY f.created_at DESC
+                """, (user_id,))
+                return [dict(row) for row in cur.fetchall()]
+
+    def send_friend_request(self, user_id: uuid.UUID, friend_id: uuid.UUID) -> Dict[str, Any]:
+        """
+        Send a friend request or accept existing one.
+
+        Args:
+            user_id: ID of user sending request
+            friend_id: ID of user receiving request
+
+        Returns:
+            Result with status
+        """
+        if user_id == friend_id:
+            return {'success': False, 'error': 'Cannot add yourself'}
+
+        with self.get_connection() as conn:
+            with conn.cursor() as cur:
+                # Check for existing friendship
+                cur.execute("""
+                    SELECT * FROM friendships
+                    WHERE (user_id = %s AND friend_id = %s)
+                       OR (user_id = %s AND friend_id = %s)
+                """, (user_id, friend_id, friend_id, user_id))
+                existing = cur.fetchone()
+
+                if existing:
+                    if existing['status'] == 'accepted':
+                        return {'success': False, 'error': 'Already friends'}
+                    elif existing['status'] == 'blocked':
+                        return {'success': False, 'error': 'Cannot add this user'}
+                    elif existing['status'] == 'pending':
+                        # If the other person sent request, accept it
+                        if existing['user_id'] == friend_id:
+                            cur.execute("""
+                                UPDATE friendships
+                                SET status = 'accepted', accepted_at = NOW()
+                                WHERE id = %s
+                            """, (existing['id'],))
+                            return {'success': True, 'status': 'accepted'}
+                        else:
+                            return {'success': False, 'error': 'Request already sent'}
+
+                # Create new request
+                cur.execute("""
+                    INSERT INTO friendships (user_id, friend_id, status)
+                    VALUES (%s, %s, 'pending')
+                    RETURNING id
+                """, (user_id, friend_id))
+                return {'success': True, 'status': 'pending'}
+
+    def accept_friend_request(self, user_id: uuid.UUID, requester_id: uuid.UUID) -> bool:
+        """
+        Accept a friend request.
+
+        Args:
+            user_id: ID of user accepting
+            requester_id: ID of user who sent request
+
+        Returns:
+            True if accepted successfully
+        """
+        with self.get_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    UPDATE friendships
+                    SET status = 'accepted', accepted_at = NOW()
+                    WHERE user_id = %s AND friend_id = %s AND status = 'pending'
+                """, (requester_id, user_id))
+                return cur.rowcount > 0
+
+    def decline_friend_request(self, user_id: uuid.UUID, requester_id: uuid.UUID) -> bool:
+        """
+        Decline/delete a friend request.
+
+        Args:
+            user_id: ID of user declining
+            requester_id: ID of user who sent request
+
+        Returns:
+            True if deleted successfully
+        """
+        with self.get_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    DELETE FROM friendships
+                    WHERE user_id = %s AND friend_id = %s AND status = 'pending'
+                """, (requester_id, user_id))
+                return cur.rowcount > 0
+
+    def remove_friend(self, user_id: uuid.UUID, friend_id: uuid.UUID) -> bool:
+        """
+        Remove a friend.
+
+        Args:
+            user_id: User ID
+            friend_id: Friend to remove
+
+        Returns:
+            True if removed successfully
+        """
+        with self.get_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    DELETE FROM friendships
+                    WHERE ((user_id = %s AND friend_id = %s)
+                       OR (user_id = %s AND friend_id = %s))
+                      AND status = 'accepted'
+                """, (user_id, friend_id, friend_id, user_id))
+                return cur.rowcount > 0
+
+    def get_friend_profile(self, user_id: uuid.UUID, friend_id: uuid.UUID) -> Optional[Dict[str, Any]]:
+        """
+        Get detailed friend profile with 7-day activity.
+
+        Args:
+            user_id: ID of user viewing
+            friend_id: ID of friend to view
+
+        Returns:
+            Friend profile with activity data
+        """
+        with self.get_connection() as conn:
+            with conn.cursor() as cur:
+                # Get basic profile
+                cur.execute("""
+                    SELECT
+                        up.user_id,
+                        up.username,
+                        up.display_name,
+                        up.friend_code,
+                        up.level,
+                        up.total_xp,
+                        COALESCE(us.streak_days, 0) as streak_days,
+                        COALESCE(us.longest_streak, 0) as longest_streak,
+                        EXISTS(
+                            SELECT 1 FROM friendships f
+                            WHERE ((f.user_id = %s AND f.friend_id = up.user_id)
+                               OR (f.friend_id = %s AND f.user_id = up.user_id))
+                              AND f.status = 'accepted'
+                        ) as is_friend
+                    FROM user_profiles up
+                    LEFT JOIN user_streaks us ON us.user_id = up.user_id
+                    WHERE up.user_id = %s
+                """, (user_id, user_id, friend_id))
+                profile = cur.fetchone()
+
+                if not profile:
+                    return None
+
+                result = dict(profile)
+
+                # Get today's stats
+                cur.execute("""
+                    SELECT COALESCE(SUM(xp_earned), 0)::INTEGER as xp_today
+                    FROM xp_transactions
+                    WHERE user_id = %s AND DATE(created_at) = CURRENT_DATE
+                """, (friend_id,))
+                xp_result = cur.fetchone()
+                result['xp_today'] = xp_result['xp_today'] if xp_result else 0
+
+                cur.execute("""
+                    SELECT COUNT(*)::INTEGER as lessons_today
+                    FROM learning_path_progress
+                    WHERE user_id = %s AND DATE(completed_at) = CURRENT_DATE AND completed = TRUE
+                """, (friend_id,))
+                lessons_result = cur.fetchone()
+                result['lessons_today'] = lessons_result['lessons_today'] if lessons_result else 0
+
+                # Get last 7 days activity
+                cur.execute("""
+                    SELECT
+                        d.day::DATE as date,
+                        COALESCE(xp.total, 0) as xp,
+                        COALESCE(lp.count, 0) as lessons
+                    FROM generate_series(CURRENT_DATE - INTERVAL '6 days', CURRENT_DATE, '1 day') as d(day)
+                    LEFT JOIN (
+                        SELECT DATE(created_at) as day, SUM(xp_earned)::INTEGER as total
+                        FROM xp_transactions
+                        WHERE user_id = %s AND DATE(created_at) >= CURRENT_DATE - INTERVAL '6 days'
+                        GROUP BY DATE(created_at)
+                    ) xp ON xp.day = d.day::DATE
+                    LEFT JOIN (
+                        SELECT DATE(completed_at) as day, COUNT(*)::INTEGER as count
+                        FROM learning_path_progress
+                        WHERE user_id = %s AND DATE(completed_at) >= CURRENT_DATE - INTERVAL '6 days' AND completed = TRUE
+                        GROUP BY DATE(completed_at)
+                    ) lp ON lp.day = d.day::DATE
+                    ORDER BY d.day
+                """, (friend_id, friend_id))
+                result['last_7_days_activity'] = [dict(row) for row in cur.fetchall()]
+
+                return result
+
+    def create_friend_challenge(self, challenger_id: uuid.UUID, challenged_id: uuid.UUID, challenge_type: str) -> Dict[str, Any]:
+        """
+        Create an async friend challenge.
+
+        Args:
+            challenger_id: ID of challenger
+            challenged_id: ID of challenged friend
+            challenge_type: 'beat_xp_today' or 'more_lessons_today'
+
+        Returns:
+            Challenge details or error
+        """
+        with self.get_connection() as conn:
+            with conn.cursor() as cur:
+                # Verify they are friends
+                cur.execute("""
+                    SELECT 1 FROM friendships
+                    WHERE ((user_id = %s AND friend_id = %s)
+                       OR (user_id = %s AND friend_id = %s))
+                      AND status = 'accepted'
+                """, (challenger_id, challenged_id, challenged_id, challenger_id))
+                if not cur.fetchone():
+                    return {'success': False, 'error': 'Users are not friends'}
+
+                # Check for existing challenge today
+                cur.execute("""
+                    SELECT id FROM friend_challenges
+                    WHERE challenger_id = %s
+                      AND challenged_id = %s
+                      AND challenge_type = %s
+                      AND challenge_date = CURRENT_DATE
+                      AND status IN ('pending', 'accepted')
+                """, (challenger_id, challenged_id, challenge_type))
+                if cur.fetchone():
+                    return {'success': False, 'error': 'Challenge already exists for today'}
+
+                # Create challenge
+                cur.execute("""
+                    INSERT INTO friend_challenges (challenger_id, challenged_id, challenge_type, challenge_date)
+                    VALUES (%s, %s, %s, CURRENT_DATE)
+                    RETURNING id, challenge_type, challenge_date, status, xp_reward
+                """, (challenger_id, challenged_id, challenge_type))
+                result = cur.fetchone()
+                return {'success': True, 'challenge': dict(result)}
+
+    def get_friend_challenges(self, user_id: uuid.UUID) -> Dict[str, List[Dict[str, Any]]]:
+        """
+        Get friend challenges for a user (sent and received).
+
+        Args:
+            user_id: User UUID
+
+        Returns:
+            Dict with 'sent' and 'received' challenge lists
+        """
+        with self.get_connection() as conn:
+            with conn.cursor() as cur:
+                # Get challenges sent by user
+                cur.execute("""
+                    SELECT
+                        fc.*,
+                        up.username as challenged_username,
+                        up.display_name as challenged_display_name
+                    FROM friend_challenges fc
+                    JOIN user_profiles up ON up.user_id = fc.challenged_id
+                    WHERE fc.challenger_id = %s
+                      AND fc.challenge_date >= CURRENT_DATE - INTERVAL '7 days'
+                    ORDER BY fc.created_at DESC
+                """, (user_id,))
+                sent = [dict(row) for row in cur.fetchall()]
+
+                # Get challenges received by user
+                cur.execute("""
+                    SELECT
+                        fc.*,
+                        up.username as challenger_username,
+                        up.display_name as challenger_display_name
+                    FROM friend_challenges fc
+                    JOIN user_profiles up ON up.user_id = fc.challenger_id
+                    WHERE fc.challenged_id = %s
+                      AND fc.challenge_date >= CURRENT_DATE - INTERVAL '7 days'
+                    ORDER BY fc.created_at DESC
+                """, (user_id,))
+                received = [dict(row) for row in cur.fetchall()]
+
+                return {'sent': sent, 'received': received}
+
+    def respond_to_challenge(self, user_id: uuid.UUID, challenge_id: uuid.UUID, accept: bool) -> bool:
+        """
+        Accept or decline a friend challenge.
+
+        Args:
+            user_id: ID of user responding
+            challenge_id: Challenge ID
+            accept: True to accept, False to decline
+
+        Returns:
+            True if successful
+        """
+        with self.get_connection() as conn:
+            with conn.cursor() as cur:
+                new_status = 'accepted' if accept else 'declined'
+                cur.execute("""
+                    UPDATE friend_challenges
+                    SET status = %s, accepted_at = CASE WHEN %s THEN NOW() ELSE NULL END
+                    WHERE id = %s AND challenged_id = %s AND status = 'pending'
+                """, (new_status, accept, challenge_id, user_id))
+                return cur.rowcount > 0
+
+    def update_challenge_scores(self, challenge_id: uuid.UUID) -> Optional[Dict[str, Any]]:
+        """
+        Update scores for a challenge and determine winner if complete.
+
+        Args:
+            challenge_id: Challenge ID
+
+        Returns:
+            Updated challenge data
+        """
+        with self.get_connection() as conn:
+            with conn.cursor() as cur:
+                # Get challenge
+                cur.execute("SELECT * FROM friend_challenges WHERE id = %s", (challenge_id,))
+                challenge = cur.fetchone()
+
+                if not challenge or challenge['status'] not in ('pending', 'accepted'):
+                    return None
+
+                # Calculate scores based on challenge type
+                if challenge['challenge_type'] == 'beat_xp_today':
+                    cur.execute("""
+                        SELECT COALESCE(SUM(xp_earned), 0)::INTEGER as score
+                        FROM xp_transactions WHERE user_id = %s AND DATE(created_at) = %s
+                    """, (challenge['challenger_id'], challenge['challenge_date']))
+                    challenger_score = cur.fetchone()['score']
+
+                    cur.execute("""
+                        SELECT COALESCE(SUM(xp_earned), 0)::INTEGER as score
+                        FROM xp_transactions WHERE user_id = %s AND DATE(created_at) = %s
+                    """, (challenge['challenged_id'], challenge['challenge_date']))
+                    challenged_score = cur.fetchone()['score']
+                else:  # more_lessons_today
+                    cur.execute("""
+                        SELECT COUNT(*)::INTEGER as score
+                        FROM learning_path_progress
+                        WHERE user_id = %s AND DATE(completed_at) = %s AND completed = TRUE
+                    """, (challenge['challenger_id'], challenge['challenge_date']))
+                    challenger_score = cur.fetchone()['score']
+
+                    cur.execute("""
+                        SELECT COUNT(*)::INTEGER as score
+                        FROM learning_path_progress
+                        WHERE user_id = %s AND DATE(completed_at) = %s AND completed = TRUE
+                    """, (challenge['challenged_id'], challenge['challenge_date']))
+                    challenged_score = cur.fetchone()['score']
+
+                # Determine winner if challenge day is over
+                from datetime import date
+                winner_id = None
+                new_status = challenge['status']
+
+                if challenge['challenge_date'] < date.today() and challenge['status'] == 'accepted':
+                    if challenger_score > challenged_score:
+                        winner_id = challenge['challenger_id']
+                    elif challenged_score > challenger_score:
+                        winner_id = challenge['challenged_id']
+                    new_status = 'completed'
+
+                # Update challenge
+                cur.execute("""
+                    UPDATE friend_challenges
+                    SET challenger_score = %s, challenged_score = %s, winner_id = %s, status = %s,
+                        completed_at = CASE WHEN %s = 'completed' THEN NOW() ELSE completed_at END
+                    WHERE id = %s
+                    RETURNING *
+                """, (challenger_score, challenged_score, winner_id, new_status, new_status, challenge_id))
+                return dict(cur.fetchone()) if cur.rowcount > 0 else None
+
+    def use_friend_invite_link(self, invite_code: str, user_id: uuid.UUID) -> Dict[str, Any]:
+        """
+        Use a friend invite link to add friend.
+
+        Args:
+            invite_code: The invite code
+            user_id: ID of user using the link
+
+        Returns:
+            Result with friend info or error
+        """
+        with self.get_connection() as conn:
+            with conn.cursor() as cur:
+                # Find the invite link
+                cur.execute("""
+                    SELECT fil.*, up.user_id as inviter_id, up.display_name as inviter_name
+                    FROM friend_invite_links fil
+                    JOIN user_profiles up ON up.user_id = fil.user_id
+                    WHERE fil.invite_code = %s AND fil.is_active = TRUE
+                      AND (fil.expires_at IS NULL OR fil.expires_at > NOW())
+                      AND (fil.max_uses IS NULL OR fil.uses_count < fil.max_uses)
+                """, (invite_code.upper(),))
+                invite = cur.fetchone()
+
+                if not invite:
+                    return {'success': False, 'error': 'Invalid or expired invite link'}
+
+                if invite['inviter_id'] == user_id:
+                    return {'success': False, 'error': 'Cannot use your own invite link'}
+
+                # Add friend (using send_friend_request logic)
+                result = self.send_friend_request(user_id, invite['inviter_id'])
+
+                if result['success']:
+                    # Increment uses count
+                    cur.execute("""
+                        UPDATE friend_invite_links SET uses_count = uses_count + 1 WHERE id = %s
+                    """, (invite['id'],))
+
+                return {**result, 'inviter_name': invite['inviter_name']}
+
+    def create_friend_invite_link(self, user_id: uuid.UUID) -> str:
+        """
+        Create a shareable friend invite link.
+
+        Args:
+            user_id: User creating the link
+
+        Returns:
+            12-character invite code
+        """
+        with self.get_connection() as conn:
+            with conn.cursor() as cur:
+                chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789'
+                import random
+                while True:
+                    code = ''.join(random.choice(chars) for _ in range(12))
+                    try:
+                        cur.execute("""
+                            INSERT INTO friend_invite_links (user_id, invite_code)
+                            VALUES (%s, %s)
+                            RETURNING invite_code
+                        """, (user_id, code))
+                        return code
+                    except Exception:
+                        continue
+
+    # ============================================================================
+    # Activity Heatmap Methods
+    # ============================================================================
+
+    def get_activity_heatmap(self, user_id: uuid.UUID, days: int = 365) -> List[Dict[str, Any]]:
+        """
+        Get daily activity data for heatmap (past N days).
+
+        Args:
+            user_id: User UUID
+            days: Number of days to look back (default 365)
+
+        Returns:
+            List of {date, xp, lessons, sessions} for each day
+        """
+        with self.get_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    SELECT
+                        d.day::DATE as date,
+                        COALESCE(xp.total, 0) as xp,
+                        COALESCE(lp.count, 0) as lessons,
+                        COALESCE(sess.count, 0) as sessions
+                    FROM generate_series(CURRENT_DATE - INTERVAL '%s days', CURRENT_DATE, '1 day') as d(day)
+                    LEFT JOIN (
+                        SELECT DATE(created_at) as day, SUM(xp_earned)::INTEGER as total
+                        FROM xp_transactions
+                        WHERE user_id = %s AND DATE(created_at) >= CURRENT_DATE - INTERVAL '%s days'
+                        GROUP BY DATE(created_at)
+                    ) xp ON xp.day = d.day::DATE
+                    LEFT JOIN (
+                        SELECT DATE(completed_at) as day, COUNT(*)::INTEGER as count
+                        FROM learning_path_progress
+                        WHERE user_id = %s AND DATE(completed_at) >= CURRENT_DATE - INTERVAL '%s days' AND completed = TRUE
+                        GROUP BY DATE(completed_at)
+                    ) lp ON lp.day = d.day::DATE
+                    LEFT JOIN (
+                        SELECT DATE(created_at) as day, COUNT(*)::INTEGER as count
+                        FROM sessions
+                        WHERE user_id = %s AND DATE(created_at) >= CURRENT_DATE - INTERVAL '%s days'
+                        GROUP BY DATE(created_at)
+                    ) sess ON sess.day = d.day::DATE
+                    ORDER BY d.day
+                """, (days, user_id, days, user_id, days, user_id, days))
+                return [dict(row) for row in cur.fetchall()]
+
+    def get_learning_insights(self, user_id: uuid.UUID) -> Dict[str, Any]:
+        """
+        Get learning insights: best study times, error patterns, streaks.
+
+        Args:
+            user_id: User UUID
+
+        Returns:
+            Dict with insights data
+        """
+        with self.get_connection() as conn:
+            with conn.cursor() as cur:
+                insights = {}
+
+                # Best study hour (by XP earned)
+                cur.execute("""
+                    SELECT EXTRACT(HOUR FROM created_at)::INTEGER as hour, SUM(xp_earned)::INTEGER as total
+                    FROM xp_transactions
+                    WHERE user_id = %s AND created_at >= CURRENT_DATE - INTERVAL '30 days'
+                    GROUP BY EXTRACT(HOUR FROM created_at)
+                    ORDER BY total DESC
+                    LIMIT 3
+                """, (user_id,))
+                best_hours = [dict(row) for row in cur.fetchall()]
+                insights['best_study_hours'] = best_hours
+
+                # Best study day (by XP earned)
+                cur.execute("""
+                    SELECT EXTRACT(DOW FROM created_at)::INTEGER as day_of_week, SUM(xp_earned)::INTEGER as total
+                    FROM xp_transactions
+                    WHERE user_id = %s AND created_at >= CURRENT_DATE - INTERVAL '90 days'
+                    GROUP BY EXTRACT(DOW FROM created_at)
+                    ORDER BY total DESC
+                """, (user_id,))
+                day_performance = [dict(row) for row in cur.fetchall()]
+                insights['day_performance'] = day_performance
+
+                # Error patterns (by type over last 30 days)
+                cur.execute("""
+                    SELECT error_type, COUNT(*)::INTEGER as count,
+                           DATE(created_at) as date
+                    FROM errors
+                    WHERE user_id = %s AND created_at >= CURRENT_DATE - INTERVAL '30 days'
+                    GROUP BY error_type, DATE(created_at)
+                    ORDER BY date
+                """, (user_id,))
+                error_trends = [dict(row) for row in cur.fetchall()]
+                insights['error_trends'] = error_trends
+
+                # Skill progression (top 5 improving skills)
+                cur.execute("""
+                    SELECT skill_key, skill_category, mastery_score, practice_count, error_count,
+                           last_practiced
+                    FROM skill_mastery
+                    WHERE user_id = %s
+                    ORDER BY last_practiced DESC
+                    LIMIT 10
+                """, (user_id,))
+                skill_progress = [dict(row) for row in cur.fetchall()]
+                insights['skill_progress'] = skill_progress
+
+                # Study streaks stats
+                cur.execute("""
+                    SELECT streak_days, longest_streak, last_activity_date
+                    FROM user_streaks
+                    WHERE user_id = %s
+                """, (user_id,))
+                streak_data = cur.fetchone()
+                if streak_data:
+                    insights['streak'] = dict(streak_data)
+                else:
+                    insights['streak'] = {'streak_days': 0, 'longest_streak': 0, 'last_activity_date': None}
+
+                # Total stats
+                cur.execute("""
+                    SELECT
+                        COALESCE(SUM(xp_earned), 0)::INTEGER as total_xp,
+                        COUNT(*)::INTEGER as total_sessions
+                    FROM xp_transactions
+                    WHERE user_id = %s
+                """, (user_id,))
+                total_stats = cur.fetchone()
+                insights['total_xp'] = total_stats['total_xp'] if total_stats else 0
+                insights['total_sessions'] = total_stats['total_sessions'] if total_stats else 0
+
+                cur.execute("""
+                    SELECT COUNT(*)::INTEGER as total_lessons
+                    FROM learning_path_progress
+                    WHERE user_id = %s AND completed = TRUE
+                """, (user_id,))
+                lesson_stats = cur.fetchone()
+                insights['total_lessons'] = lesson_stats['total_lessons'] if lesson_stats else 0
+
+                return insights
+
     # Health Check
 
     def health_check(self) -> bool:

@@ -267,3 +267,76 @@ BEGIN
   LIMIT p_limit;
 END;
 $$ LANGUAGE plpgsql;
+
+-- ============================================================================
+-- Analytics Tables
+-- ============================================================================
+
+-- Study Sessions (for time tracking)
+CREATE TABLE IF NOT EXISTS study_sessions (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  user_id UUID REFERENCES user_profiles(user_id),
+  activity_type VARCHAR(50) NOT NULL,  -- lesson, drill, voice, review, exercise
+  duration_seconds INTEGER NOT NULL,
+  started_at TIMESTAMP,
+  created_at TIMESTAMP DEFAULT NOW()
+);
+
+CREATE INDEX idx_study_sessions_user_date ON study_sessions(user_id, created_at DESC);
+
+-- XP Log (for tracking XP earned per activity)
+CREATE TABLE IF NOT EXISTS xp_log (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  user_id UUID REFERENCES user_profiles(user_id),
+  activity_type VARCHAR(50) NOT NULL,
+  xp_earned INTEGER NOT NULL,
+  bonus_xp INTEGER DEFAULT 0,
+  created_at TIMESTAMP DEFAULT NOW()
+);
+
+CREATE INDEX idx_xp_log_user_date ON xp_log(user_id, created_at DESC);
+
+-- User Streaks (for tracking daily practice streaks)
+CREATE TABLE IF NOT EXISTS user_streaks (
+  user_id UUID PRIMARY KEY REFERENCES user_profiles(user_id),
+  current_streak INTEGER DEFAULT 0,
+  longest_streak INTEGER DEFAULT 0,
+  last_active_date DATE,
+  weekly_minutes INTEGER DEFAULT 0,
+  total_days_active INTEGER DEFAULT 0,
+  updated_at TIMESTAMP DEFAULT NOW()
+);
+
+-- Achievements
+CREATE TABLE IF NOT EXISTS achievements (
+  achievement_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  key VARCHAR(100) UNIQUE NOT NULL,
+  title VARCHAR(200) NOT NULL,
+  description TEXT,
+  category VARCHAR(50),  -- learning, streak, mastery, social
+  xp_reward INTEGER DEFAULT 0,
+  tier VARCHAR(20) DEFAULT 'bronze',  -- bronze, silver, gold, platinum
+  icon VARCHAR(100),
+  created_at TIMESTAMP DEFAULT NOW()
+);
+
+-- User Achievements (unlocked achievements)
+CREATE TABLE IF NOT EXISTS user_achievements (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  user_id UUID REFERENCES user_profiles(user_id),
+  achievement_id UUID REFERENCES achievements(achievement_id),
+  unlocked_at TIMESTAMP DEFAULT NOW(),
+  UNIQUE(user_id, achievement_id)
+);
+
+CREATE INDEX idx_user_achievements_user ON user_achievements(user_id);
+
+-- Seed some default achievements
+INSERT INTO achievements (key, title, description, category, xp_reward, tier) VALUES
+  ('first_lesson', 'First Steps', 'Complete your first lesson', 'learning', 50, 'bronze'),
+  ('week_streak', 'Week Warrior', 'Practice for 7 days in a row', 'streak', 100, 'silver'),
+  ('pronunciation_master', 'Sound Perfect', 'Score 90+ on pronunciation', 'mastery', 150, 'gold'),
+  ('100_exercises', 'Century Club', 'Complete 100 exercises', 'learning', 200, 'gold'),
+  ('voice_explorer', 'Voice Explorer', 'Complete 10 voice sessions', 'learning', 75, 'bronze'),
+  ('month_streak', 'Monthly Master', 'Practice for 30 days in a row', 'streak', 300, 'platinum')
+ON CONFLICT (key) DO NOTHING;

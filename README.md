@@ -1,12 +1,16 @@
-# SpeakSharp Core MVP
+# Vorex Core API
 
-AI-powered English learning tutor core system with state machine, scenario-based learning, error tagging, and spaced repetition.
+AI-powered English learning tutor core system with state machine, scenario-based learning, error tagging, spaced repetition, and adaptive placement testing.
+
+**Live API**: https://speaksharp-core-production.up.railway.app
 
 ## Project Structure
 
 ```
-speaksharp-core/
+vorex-backend/
 ├── app/
+│   ├── api2.py             # Production API (used by Dockerfile)
+│   ├── api.py              # Development API
 │   ├── models.py           # Pydantic data models
 │   ├── state_machine.py    # App state machine with 5 states
 │   ├── tutor_agent.py      # AI tutor with error tagging
@@ -275,6 +279,14 @@ error = db.log_error(
 )
 ```
 
+## Important: Production vs Development API
+
+The project has two API files:
+- **`app/api2.py`** - Production API used by Docker/Railway deployment
+- **`app/api.py`** - Development API for local testing
+
+The Dockerfile runs `uvicorn app.api2:app`. When adding new endpoints for production, add them to `api2.py`.
+
 ## Running the Application
 
 ### Option 1: Docker Compose (Recommended)
@@ -377,6 +389,31 @@ curl -X POST http://localhost:8000/api/tutor/voice \
     "audio_path": "/path/to/audio.wav"
   }'
 ```
+
+#### Adaptive Placement Test
+
+Start a new adaptive test session:
+```bash
+curl -X POST http://localhost:8000/api/placement-test/adaptive/start
+```
+
+Submit an answer and get next question or final result:
+```bash
+curl -X POST http://localhost:8000/api/placement-test/adaptive/answer \
+  -H "Content-Type: application/json" \
+  -d '{
+    "session_id": "session-uuid",
+    "question_id": "question-uuid",
+    "answer": "B"
+  }'
+```
+
+The adaptive algorithm:
+- Starts at B1 level
+- 2 correct answers in a row → move up one level
+- 2 wrong answers in a row → move down one level
+- Ends after 10-15 questions or when level stabilizes
+- Returns final CEFR level (A1-C2) with confidence score
 
 See full API documentation at `http://localhost:8000/docs` when the server is running.
 
@@ -563,6 +600,26 @@ docker compose exec api bash    # Shell into API container
 docker compose exec db psql -U speaksharp_user -d speaksharp_db  # DB shell
 ```
 
+## Deployment
+
+### Railway (Production)
+
+```bash
+# Link to project
+railway link
+
+# Deploy
+railway up --detach
+
+# View logs
+railway logs
+
+# Check status
+railway status
+```
+
+**Production URL**: https://speaksharp-core-production.up.railway.app
+
 ## Next Steps
 
 - ✅ Database layer with PostgreSQL/Supabase
@@ -571,9 +628,13 @@ docker compose exec db psql -U speaksharp_user -d speaksharp_db  # DB shell
 - ✅ Pytest test suite
 - ✅ LLM integration (OpenAI/Anthropic)
 - ✅ Voice pipeline (ASR/TTS)
-- 🔄 Build client UI (web/mobile)
-- 🔄 Add authentication (Supabase Auth)
+- ✅ Adaptive placement test with CEFR level detection
+- ✅ Frontend client (Next.js at vorex.app)
+- ✅ Authentication (Supabase Auth)
+- ✅ Railway deployment
 - 🔄 Add more scenarios (currently 5, target 30-50)
 - 🔄 Expand lessons beyond A2 (currently 11 A1-A2 lessons)
 - 🔄 Implement pronunciation scoring
 - 🔄 Add analytics and progress tracking
+
+**Last Updated**: December 7, 2025

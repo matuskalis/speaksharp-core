@@ -138,6 +138,173 @@ ACHIEVEMENTS = [
         "category": "milestone",
         "points": 1000,
         "tier": "platinum"
+    },
+    # XP Milestones
+    {
+        "achievement_key": "xp_100",
+        "title": "XP Collector",
+        "description": "Earn 100 total XP",
+        "category": "milestone",
+        "points": 25,
+        "tier": "bronze"
+    },
+    {
+        "achievement_key": "xp_500",
+        "title": "XP Hunter",
+        "description": "Earn 500 total XP",
+        "category": "milestone",
+        "points": 50,
+        "tier": "bronze"
+    },
+    {
+        "achievement_key": "xp_1000",
+        "title": "XP Champion",
+        "description": "Earn 1,000 total XP",
+        "category": "milestone",
+        "points": 100,
+        "tier": "silver"
+    },
+    {
+        "achievement_key": "xp_5000",
+        "title": "XP Legend",
+        "description": "Earn 5,000 total XP",
+        "category": "milestone",
+        "points": 250,
+        "tier": "gold"
+    },
+    {
+        "achievement_key": "xp_10000",
+        "title": "XP Master",
+        "description": "Earn 10,000 total XP",
+        "category": "milestone",
+        "points": 500,
+        "tier": "platinum"
+    },
+    # Voice Practice
+    {
+        "achievement_key": "first_voice",
+        "title": "Finding Your Voice",
+        "description": "Complete your first voice practice session",
+        "category": "voice",
+        "points": 20,
+        "tier": "bronze"
+    },
+    {
+        "achievement_key": "voice_5",
+        "title": "Voice Explorer",
+        "description": "Complete 5 voice practice sessions",
+        "category": "voice",
+        "points": 50,
+        "tier": "bronze"
+    },
+    {
+        "achievement_key": "voice_25",
+        "title": "Voice Enthusiast",
+        "description": "Complete 25 voice practice sessions",
+        "category": "voice",
+        "points": 150,
+        "tier": "silver"
+    },
+    {
+        "achievement_key": "voice_100",
+        "title": "Voice Master",
+        "description": "Complete 100 voice practice sessions",
+        "category": "voice",
+        "points": 400,
+        "tier": "gold"
+    },
+    # Pronunciation
+    {
+        "achievement_key": "pronunciation_80",
+        "title": "Clear Speaker",
+        "description": "Score 80% or higher on pronunciation",
+        "category": "pronunciation",
+        "points": 50,
+        "tier": "bronze"
+    },
+    {
+        "achievement_key": "pronunciation_90",
+        "title": "Pronunciation Pro",
+        "description": "Score 90% or higher on pronunciation",
+        "category": "pronunciation",
+        "points": 100,
+        "tier": "silver"
+    },
+    {
+        "achievement_key": "pronunciation_95",
+        "title": "Native-Like",
+        "description": "Score 95% or higher on pronunciation",
+        "category": "pronunciation",
+        "points": 200,
+        "tier": "gold"
+    },
+    # Perfect Scores
+    {
+        "achievement_key": "perfect_lesson",
+        "title": "Perfectionist",
+        "description": "Complete a lesson with 100% accuracy",
+        "category": "mastery",
+        "points": 50,
+        "tier": "bronze"
+    },
+    {
+        "achievement_key": "perfect_5",
+        "title": "Flawless Five",
+        "description": "Complete 5 lessons with 100% accuracy",
+        "category": "mastery",
+        "points": 150,
+        "tier": "silver"
+    },
+    {
+        "achievement_key": "perfect_20",
+        "title": "Perfect Record",
+        "description": "Complete 20 lessons with 100% accuracy",
+        "category": "mastery",
+        "points": 400,
+        "tier": "gold"
+    },
+    # Speed
+    {
+        "achievement_key": "speed_demon",
+        "title": "Speed Demon",
+        "description": "Complete a lesson in under 2 minutes",
+        "category": "special",
+        "points": 30,
+        "tier": "bronze"
+    },
+    # Comeback
+    {
+        "achievement_key": "comeback_kid",
+        "title": "Comeback Kid",
+        "description": "Return after 7+ days away",
+        "category": "special",
+        "points": 50,
+        "tier": "bronze"
+    },
+    # Learning Path
+    {
+        "achievement_key": "path_started",
+        "title": "Journey Begins",
+        "description": "Start your learning path",
+        "category": "milestone",
+        "points": 15,
+        "tier": "bronze"
+    },
+    {
+        "achievement_key": "unit_complete",
+        "title": "Unit Master",
+        "description": "Complete your first unit",
+        "category": "milestone",
+        "points": 75,
+        "tier": "bronze"
+    },
+    {
+        "achievement_key": "path_complete",
+        "title": "Path Pioneer",
+        "description": "Complete an entire learning path",
+        "category": "milestone",
+        "points": 500,
+        "tier": "gold"
     }
 ]
 

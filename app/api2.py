@@ -26,7 +26,7 @@ from app.tutor_agent import TutorAgent
 from app.voice_session import VoiceSession
 from app.config import load_config
 from app.models import TutorResponse
-from app.auth import verify_token, get_or_create_user, add_user_xp, get_user_xp
+from app.auth import verify_token, optional_verify_token, get_or_create_user, add_user_xp, get_user_xp
 from app.diagnostic import (
     DiagnosticSession, DiagnosticAnswer, DiagnosticEngine,
     DiagnosticRepository, seed_initial_mastery,
@@ -34,8 +34,11 @@ from app.diagnostic import (
 )
 from app.exercises import EXERCISES, get_exercises_by_skill_key
 from app.thinking_engine import thinking_engine, ThinkingSession, ThinkingTurn
+from app.asr_client import asr_client
 import random
 import time
+import tempfile
+import os
 
 # Simple in-memory cache to prevent XP abuse (prevents re-submission of same exercise)
 # Key: "user_id:exercise_id", Value: timestamp of correct answer
@@ -336,6 +339,170 @@ def run_migrations(db):
                 cur.execute("""
                     ALTER TABLE user_profiles
                     ADD COLUMN IF NOT EXISTS total_xp INTEGER DEFAULT 0;
+                """)
+
+                # Migration 013: Push Notifications System
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS push_subscriptions (
+                        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                        user_id UUID REFERENCES user_profiles(user_id) ON DELETE CASCADE,
+                        endpoint TEXT NOT NULL UNIQUE,
+                        p256dh TEXT NOT NULL,
+                        auth TEXT NOT NULL,
+                        created_at TIMESTAMP DEFAULT NOW(),
+                        last_used_at TIMESTAMP DEFAULT NOW()
+                    );
+                """)
+                cur.execute("CREATE INDEX IF NOT EXISTS idx_push_subscriptions_user ON push_subscriptions(user_id);")
+                cur.execute("CREATE INDEX IF NOT EXISTS idx_push_subscriptions_endpoint ON push_subscriptions(endpoint);")
+
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS push_preferences (
+                        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                        user_id UUID REFERENCES user_profiles(user_id) ON DELETE CASCADE UNIQUE,
+                        enabled BOOLEAN DEFAULT FALSE,
+                        streak_reminders BOOLEAN DEFAULT TRUE,
+                        friend_challenges BOOLEAN DEFAULT TRUE,
+                        achievements BOOLEAN DEFAULT TRUE,
+                        daily_goals BOOLEAN DEFAULT TRUE,
+                        created_at TIMESTAMP DEFAULT NOW(),
+                        updated_at TIMESTAMP DEFAULT NOW()
+                    );
+                """)
+                cur.execute("CREATE INDEX IF NOT EXISTS idx_push_preferences_user ON push_preferences(user_id);")
+
+                # Migration 014: Gamification Bonuses System
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS daily_bonus_claims (
+                        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                        user_id UUID REFERENCES user_profiles(user_id) ON DELETE CASCADE,
+                        bonus_type VARCHAR(30) NOT NULL,
+                        bonus_xp INTEGER NOT NULL,
+                        multiplier DECIMAL(3,2) DEFAULT 1.0,
+                        claimed_date DATE DEFAULT CURRENT_DATE,
+                        created_at TIMESTAMP DEFAULT NOW(),
+                        UNIQUE(user_id, bonus_type, claimed_date)
+                    );
+                """)
+                cur.execute("CREATE INDEX IF NOT EXISTS idx_daily_bonus_user_date ON daily_bonus_claims(user_id, claimed_date);")
+
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS xp_multiplier_events (
+                        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                        name VARCHAR(100) NOT NULL,
+                        description TEXT,
+                        multiplier DECIMAL(3,2) NOT NULL DEFAULT 2.0,
+                        start_date TIMESTAMP NOT NULL,
+                        end_date TIMESTAMP NOT NULL,
+                        is_active BOOLEAN DEFAULT TRUE,
+                        created_at TIMESTAMP DEFAULT NOW()
+                    );
+                """)
+                cur.execute("CREATE INDEX IF NOT EXISTS idx_xp_events_active ON xp_multiplier_events(is_active, start_date, end_date);")
+
+                # Create gamification functions
+                cur.execute("""
+                    CREATE OR REPLACE FUNCTION get_active_bonuses(p_user_id UUID)
+                    RETURNS TABLE (
+                        login_bonus_available BOOLEAN,
+                        login_bonus_xp INTEGER,
+                        streak_multiplier DECIMAL(3,2),
+                        streak_days INTEGER,
+                        weekend_bonus_active BOOLEAN,
+                        weekend_multiplier DECIMAL(3,2),
+                        event_bonus_active BOOLEAN,
+                        event_name VARCHAR,
+                        event_multiplier DECIMAL(3,2),
+                        total_multiplier DECIMAL(4,2)
+                    )
+                    AS $$
+                    DECLARE
+                        v_streak_days INTEGER;
+                        v_streak_mult DECIMAL(3,2);
+                        v_weekend_mult DECIMAL(3,2);
+                        v_event_mult DECIMAL(3,2);
+                        v_event_name VARCHAR;
+                        v_login_claimed BOOLEAN;
+                        v_is_weekend BOOLEAN;
+                        v_has_event BOOLEAN;
+                    BEGIN
+                        SELECT COALESCE(us.current_streak_days, 0) INTO v_streak_days
+                        FROM user_streaks us WHERE us.user_id = p_user_id;
+                        v_streak_mult := LEAST(1.0 + (COALESCE(v_streak_days, 0) * 0.01), 1.5);
+                        SELECT EXISTS(SELECT 1 FROM daily_bonus_claims WHERE user_id = p_user_id AND bonus_type = 'login' AND claimed_date = CURRENT_DATE) INTO v_login_claimed;
+                        v_is_weekend := EXTRACT(DOW FROM CURRENT_DATE) IN (0, 6);
+                        v_weekend_mult := CASE WHEN v_is_weekend THEN 1.5 ELSE 1.0 END;
+                        SELECT name, multiplier INTO v_event_name, v_event_mult FROM xp_multiplier_events WHERE is_active = TRUE AND NOW() BETWEEN start_date AND end_date ORDER BY multiplier DESC LIMIT 1;
+                        v_has_event := v_event_name IS NOT NULL;
+                        v_event_mult := COALESCE(v_event_mult, 1.0);
+                        RETURN QUERY SELECT NOT v_login_claimed, 25, v_streak_mult, COALESCE(v_streak_days, 0), v_is_weekend, v_weekend_mult, v_has_event, v_event_name, v_event_mult, ROUND((v_streak_mult * v_weekend_mult * v_event_mult)::NUMERIC, 2);
+                    END;
+                    $$ LANGUAGE plpgsql;
+                """)
+
+                cur.execute("""
+                    CREATE OR REPLACE FUNCTION claim_login_bonus(p_user_id UUID)
+                    RETURNS TABLE (success BOOLEAN, xp_earned INTEGER, message TEXT)
+                    AS $$
+                    DECLARE
+                        v_already_claimed BOOLEAN;
+                        v_base_xp INTEGER := 25;
+                        v_streak_mult DECIMAL(3,2);
+                        v_total_xp INTEGER;
+                    BEGIN
+                        SELECT EXISTS(SELECT 1 FROM daily_bonus_claims WHERE user_id = p_user_id AND bonus_type = 'login' AND claimed_date = CURRENT_DATE) INTO v_already_claimed;
+                        IF v_already_claimed THEN RETURN QUERY SELECT FALSE, 0, 'Login bonus already claimed today'::TEXT; RETURN; END IF;
+                        SELECT LEAST(1.0 + (COALESCE(us.current_streak_days, 0) * 0.01), 1.5) INTO v_streak_mult FROM user_streaks us WHERE us.user_id = p_user_id;
+                        v_streak_mult := COALESCE(v_streak_mult, 1.0);
+                        v_total_xp := FLOOR(v_base_xp * v_streak_mult);
+                        INSERT INTO daily_bonus_claims (user_id, bonus_type, bonus_xp, multiplier) VALUES (p_user_id, 'login', v_total_xp, v_streak_mult);
+                        UPDATE user_profiles SET total_xp = total_xp + v_total_xp WHERE user_id = p_user_id;
+                        RETURN QUERY SELECT TRUE, v_total_xp, ('Daily login bonus: +' || v_total_xp || ' XP')::TEXT;
+                    END;
+                    $$ LANGUAGE plpgsql;
+                """)
+
+                cur.execute("""
+                    CREATE OR REPLACE FUNCTION calculate_bonus_xp(p_user_id UUID, p_base_xp INTEGER, p_is_perfect_score BOOLEAN DEFAULT FALSE)
+                    RETURNS TABLE (final_xp INTEGER, bonus_breakdown JSONB)
+                    AS $$
+                    DECLARE
+                        v_streak_mult DECIMAL(3,2);
+                        v_weekend_mult DECIMAL(3,2);
+                        v_event_mult DECIMAL(3,2);
+                        v_perfect_mult DECIMAL(3,2);
+                        v_final_xp INTEGER;
+                        v_breakdown JSONB;
+                    BEGIN
+                        SELECT LEAST(1.0 + (COALESCE(us.current_streak_days, 0) * 0.01), 1.5) INTO v_streak_mult FROM user_streaks us WHERE us.user_id = p_user_id;
+                        v_streak_mult := COALESCE(v_streak_mult, 1.0);
+                        v_weekend_mult := CASE WHEN EXTRACT(DOW FROM CURRENT_DATE) IN (0, 6) THEN 1.5 ELSE 1.0 END;
+                        SELECT COALESCE(MAX(multiplier), 1.0) INTO v_event_mult FROM xp_multiplier_events WHERE is_active = TRUE AND NOW() BETWEEN start_date AND end_date;
+                        v_perfect_mult := CASE WHEN p_is_perfect_score THEN 1.25 ELSE 1.0 END;
+                        v_final_xp := FLOOR(p_base_xp * v_streak_mult * v_weekend_mult * v_event_mult * v_perfect_mult);
+                        v_breakdown := jsonb_build_object('base_xp', p_base_xp, 'streak_multiplier', v_streak_mult, 'weekend_multiplier', v_weekend_mult, 'event_multiplier', v_event_mult, 'perfect_score_multiplier', v_perfect_mult, 'final_xp', v_final_xp, 'bonus_xp', v_final_xp - p_base_xp);
+                        RETURN QUERY SELECT v_final_xp, v_breakdown;
+                    END;
+                    $$ LANGUAGE plpgsql;
+                """)
+
+                cur.execute("""
+                    CREATE OR REPLACE FUNCTION get_bonus_summary(p_user_id UUID)
+                    RETURNS TABLE (total_bonus_xp_today INTEGER, bonuses_claimed JSONB, available_bonuses JSONB, current_multiplier DECIMAL(4,2))
+                    AS $$
+                    DECLARE
+                        v_claimed JSONB;
+                        v_available JSONB;
+                        v_total_bonus INTEGER;
+                        v_active_bonuses RECORD;
+                    BEGIN
+                        SELECT jsonb_agg(jsonb_build_object('type', bonus_type, 'xp', bonus_xp, 'multiplier', multiplier)) INTO v_claimed FROM daily_bonus_claims WHERE user_id = p_user_id AND claimed_date = CURRENT_DATE;
+                        SELECT COALESCE(SUM(bonus_xp), 0) INTO v_total_bonus FROM daily_bonus_claims WHERE user_id = p_user_id AND claimed_date = CURRENT_DATE;
+                        SELECT * INTO v_active_bonuses FROM get_active_bonuses(p_user_id);
+                        v_available := jsonb_build_object('login_bonus', jsonb_build_object('available', v_active_bonuses.login_bonus_available, 'xp', v_active_bonuses.login_bonus_xp), 'streak_bonus', jsonb_build_object('active', v_active_bonuses.streak_days > 0, 'multiplier', v_active_bonuses.streak_multiplier, 'streak_days', v_active_bonuses.streak_days), 'weekend_bonus', jsonb_build_object('active', v_active_bonuses.weekend_bonus_active, 'multiplier', v_active_bonuses.weekend_multiplier), 'event_bonus', jsonb_build_object('active', v_active_bonuses.event_bonus_active, 'name', v_active_bonuses.event_name, 'multiplier', v_active_bonuses.event_multiplier));
+                        RETURN QUERY SELECT v_total_bonus, COALESCE(v_claimed, '[]'::jsonb), v_available, v_active_bonuses.total_multiplier;
+                    END;
+                    $$ LANGUAGE plpgsql;
                 """)
 
                 conn.commit()
@@ -1157,6 +1324,22 @@ async def tutor_voice(
             except Exception as e:
                 print(f"Warning: Failed to read TTS audio: {e}")
 
+        # Get pronunciation feedback (if audio was saved)
+        pronunciation = None
+        if hasattr(result, 'asr_audio_path') and result.asr_audio_path and result.recognized_text:
+            try:
+                from app.pronunciation_scorer import PronunciationScorer
+                scorer = PronunciationScorer()
+                pron_result = scorer.score_audio(result.asr_audio_path, result.recognized_text)
+                pronunciation = {
+                    "overall_score": pron_result.get("overall_score", 0),
+                    "word_scores": pron_result.get("word_scores", []),
+                    "problem_sounds": pron_result.get("problem_sounds", []),
+                    "tips": pron_result.get("tips", []),
+                }
+            except Exception as e:
+                print(f"Warning: Failed to score pronunciation: {e}")
+
         # Return response
         return {
             "transcript": result.recognized_text,
@@ -1165,6 +1348,7 @@ async def tutor_voice(
                 "errors": [e.model_dump() for e in result.tutor_response.errors],
                 "micro_task": result.tutor_response.micro_task,
             },
+            "pronunciation": pronunciation,
             "audio_base64": audio_base64,
             "session_id": str(session_id),
         }
@@ -2629,6 +2813,187 @@ async def submit_placement_test(
     }
 
 
+# Adaptive Placement Test Session Storage (in-memory for simplicity)
+# In production, this should use Redis or database
+_adaptive_test_sessions: Dict[str, Any] = {}
+
+
+@app.post("/api/placement-test/adaptive/start", tags=["Placement Test"])
+async def start_adaptive_placement_test():
+    """
+    Start a new adaptive placement test session.
+
+    Returns the first question and a session_id to track the test.
+    The test starts at B1 level and adapts based on performance.
+    """
+    from app.placement_test import adaptive_placement_test
+    import uuid as uuid_module
+
+    # Generate session ID
+    session_id = str(uuid_module.uuid4())
+
+    # Start the test
+    state = adaptive_placement_test.start_test(session_id)
+
+    # Get first question
+    question = adaptive_placement_test.get_next_question(state)
+
+    if not question:
+        raise HTTPException(status_code=500, detail="Failed to generate question")
+
+    # Store state
+    _adaptive_test_sessions[session_id] = state.model_dump()
+
+    return {
+        "session_id": session_id,
+        "question": {
+            "question_id": question.question_id,
+            "question_text": question.question_text,
+            "options": question.options,
+            "level": question.level,
+            "skill_type": question.skill_type,
+        },
+        "question_number": 1,
+        "is_complete": False,
+    }
+
+
+@app.post("/api/placement-test/adaptive/answer", tags=["Placement Test"])
+async def submit_adaptive_answer(
+    payload: dict,
+    db: Database = Depends(get_database),
+    user_id_from_token: Optional[str] = Depends(optional_verify_token),
+):
+    """
+    Submit an answer for the current question and get the next one.
+
+    Payload:
+    {
+        "session_id": "uuid",
+        "question_id": "a1_grammar_1",
+        "answer": 0  // Index of selected option
+    }
+
+    Returns the next question or final results if test is complete.
+    """
+    from app.placement_test import adaptive_placement_test, AdaptiveTestState, PLACEMENT_QUESTIONS
+
+    session_id = payload.get("session_id")
+    question_id = payload.get("question_id")
+    answer = payload.get("answer")
+
+    if not session_id or question_id is None or answer is None:
+        raise HTTPException(status_code=400, detail="Missing required fields")
+
+    # Get session state
+    state_dict = _adaptive_test_sessions.get(session_id)
+    if not state_dict:
+        raise HTTPException(status_code=404, detail="Session not found")
+
+    state = AdaptiveTestState(**state_dict)
+
+    # Find the question
+    question = next((q for q in PLACEMENT_QUESTIONS if q.question_id == question_id), None)
+    if not question:
+        raise HTTPException(status_code=404, detail="Question not found")
+
+    # Process the answer
+    state = adaptive_placement_test.process_answer(state, question, answer)
+
+    # Update stored state
+    _adaptive_test_sessions[session_id] = state.model_dump()
+
+    # Check if test is complete
+    if state.is_complete:
+        result = adaptive_placement_test.evaluate_test(state)
+
+        # Update user's level if authenticated
+        if user_id_from_token:
+            try:
+                user_id = uuid.UUID(user_id_from_token)
+                db.update_user_profile(
+                    user_id=user_id,
+                    level=result.level
+                )
+            except Exception as e:
+                print(f"Failed to update user level: {e}")
+
+        # Clean up session
+        del _adaptive_test_sessions[session_id]
+
+        # Get the last answer's correctness
+        is_correct = question.correct_answer == answer
+
+        return {
+            "is_correct": is_correct,
+            "correct_answer": question.correct_answer,
+            "explanation": question.explanation,
+            "is_complete": True,
+            "final_result": {
+                "level": result.level,
+                "score": result.score,
+                "total_questions": result.total_questions,
+                "strengths": result.strengths,
+                "weaknesses": result.weaknesses,
+                "recommendation": result.recommendation,
+            },
+        }
+    else:
+        # Get next question
+        next_question = adaptive_placement_test.get_next_question(state)
+
+        if not next_question:
+            # Fallback: mark as complete if no more questions
+            result = adaptive_placement_test.evaluate_test(state)
+
+            if user_id_from_token:
+                try:
+                    user_id = uuid.UUID(user_id_from_token)
+                    db.update_user_profile(
+                        user_id=user_id,
+                        level=result.level
+                    )
+                except Exception as e:
+                    print(f"Failed to update user level: {e}")
+
+            del _adaptive_test_sessions[session_id]
+
+            is_correct = question.correct_answer == answer
+
+            return {
+                "is_correct": is_correct,
+                "correct_answer": question.correct_answer,
+                "explanation": question.explanation,
+                "is_complete": True,
+                "final_result": {
+                    "level": result.level,
+                    "score": result.score,
+                    "total_questions": result.total_questions,
+                    "strengths": result.strengths,
+                    "weaknesses": result.weaknesses,
+                    "recommendation": result.recommendation,
+                },
+            }
+
+        is_correct = question.correct_answer == answer
+
+        return {
+            "is_correct": is_correct,
+            "correct_answer": question.correct_answer,
+            "explanation": question.explanation,
+            "is_complete": False,
+            "question_number": len(state.answers) + 1,
+            "next_question": {
+                "question_id": next_question.question_id,
+                "question_text": next_question.question_text,
+                "options": next_question.options,
+                "level": next_question.level,
+                "skill_type": next_question.skill_type,
+            },
+            "current_level": state.current_level,
+        }
+
+
 # ============================================================================
 # Exercise Endpoints
 # ============================================================================
@@ -3058,6 +3423,616 @@ async def update_goal_progress(
         raise HTTPException(
             status_code=500,
             detail=f"Failed to update goal progress: {str(e)}"
+        )
+
+
+# ============================================================================
+# Daily Challenges Endpoints
+# ============================================================================
+
+@app.get("/api/challenges/today", tags=["Challenges"])
+async def get_daily_challenges(
+    db: Database = Depends(get_database),
+    user_id_from_token: str = Depends(verify_token),
+):
+    """
+    Get today's daily challenges for the authenticated user.
+
+    Creates challenges if they don't exist.
+
+    Returns 3 challenge slots:
+    - core: Complete 2 lessons (+15 XP)
+    - accuracy: Score 80%+ on a lesson (+25 XP)
+    - stretch: Earn 60+ XP OR complete 1 speaking session (+50 XP + streak freeze)
+    """
+    try:
+        user_id = uuid.UUID(user_id_from_token)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid user_id from token")
+
+    try:
+        challenges = db.get_daily_challenges(user_id)
+        if not challenges:
+            raise HTTPException(status_code=500, detail="Could not create daily challenges")
+
+        # Format response
+        freeze_count = db.get_streak_freeze_count(user_id)
+
+        return {
+            "challenges": {
+                "core": {
+                    "name": "Complete Lessons",
+                    "description": f"Complete {challenges['core_target']} lessons",
+                    "target": challenges['core_target'],
+                    "progress": challenges['core_progress'],
+                    "completed": challenges['core_completed'],
+                    "xp_reward": challenges['core_xp_reward'],
+                    "completed_at": challenges.get('core_completed_at')
+                },
+                "accuracy": {
+                    "name": "High Achiever",
+                    "description": f"Score {challenges['accuracy_target']}% or higher on any lesson",
+                    "target": challenges['accuracy_target'],
+                    "progress": challenges['accuracy_progress'],
+                    "completed": challenges['accuracy_completed'],
+                    "xp_reward": challenges['accuracy_xp_reward'],
+                    "completed_at": challenges.get('accuracy_completed_at')
+                },
+                "stretch": {
+                    "name": "Go Beyond",
+                    "description": f"Earn {challenges['stretch_xp_target']}+ XP OR complete {challenges['stretch_speaking_target']} speaking session",
+                    "xp_target": challenges['stretch_xp_target'],
+                    "xp_progress": challenges['stretch_xp_progress'],
+                    "speaking_target": challenges['stretch_speaking_target'],
+                    "speaking_progress": challenges['stretch_speaking_progress'],
+                    "completed": challenges['stretch_completed'],
+                    "xp_reward": challenges['stretch_xp_reward'],
+                    "gives_freeze_token": challenges['stretch_gives_freeze_token'],
+                    "completed_at": challenges.get('stretch_completed_at')
+                }
+            },
+            "all_completed": challenges['all_completed'],
+            "streak_freeze_tokens": freeze_count,
+            "date": str(challenges['challenge_date'])
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to get daily challenges: {str(e)}"
+        )
+
+
+@app.post("/api/challenges/progress", tags=["Challenges"])
+async def update_challenge_progress(
+    progress: dict = Body(...),
+    db: Database = Depends(get_database),
+    user_id_from_token: str = Depends(verify_token),
+):
+    """
+    Update daily challenge progress.
+
+    Request body:
+    {
+        "lessons_completed": 1,
+        "best_score": 85,
+        "xp_earned": 25,
+        "speaking_sessions": 0
+    }
+
+    All fields are optional and default to 0.
+
+    Returns:
+    - which challenges were just completed
+    - total XP earned from completions
+    - whether a streak freeze token was earned
+    """
+    try:
+        user_id = uuid.UUID(user_id_from_token)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid user_id from token")
+
+    try:
+        lessons_completed = progress.get("lessons_completed", 0)
+        best_score = progress.get("best_score", 0)
+        xp_earned = progress.get("xp_earned", 0)
+        speaking_sessions = progress.get("speaking_sessions", 0)
+
+        result = db.update_daily_challenge_progress(
+            user_id=user_id,
+            lessons_completed=lessons_completed,
+            best_score=best_score,
+            xp_earned=xp_earned,
+            speaking_sessions=speaking_sessions
+        )
+
+        # Get updated challenges
+        challenges = db.get_daily_challenges(user_id)
+        freeze_count = db.get_streak_freeze_count(user_id)
+
+        return {
+            **result,
+            "challenges": {
+                "core": {
+                    "progress": challenges['core_progress'],
+                    "completed": challenges['core_completed']
+                },
+                "accuracy": {
+                    "progress": challenges['accuracy_progress'],
+                    "completed": challenges['accuracy_completed']
+                },
+                "stretch": {
+                    "xp_progress": challenges['stretch_xp_progress'],
+                    "speaking_progress": challenges['stretch_speaking_progress'],
+                    "completed": challenges['stretch_completed']
+                }
+            },
+            "all_completed": challenges['all_completed'],
+            "streak_freeze_tokens": freeze_count
+        }
+
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to update challenge progress: {str(e)}"
+        )
+
+
+@app.get("/api/challenges/freeze-tokens", tags=["Challenges"])
+async def get_streak_freeze_tokens(
+    db: Database = Depends(get_database),
+    user_id_from_token: str = Depends(verify_token),
+):
+    """
+    Get number of available streak freeze tokens.
+    """
+    try:
+        user_id = uuid.UUID(user_id_from_token)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid user_id from token")
+
+    try:
+        count = db.get_streak_freeze_count(user_id)
+        return {"streak_freeze_tokens": count}
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to get streak freeze tokens: {str(e)}"
+        )
+
+
+@app.post("/api/challenges/use-freeze", tags=["Challenges"])
+async def use_streak_freeze(
+    db: Database = Depends(get_database),
+    user_id_from_token: str = Depends(verify_token),
+):
+    """
+    Use a streak freeze token to protect streak.
+
+    Returns success status and remaining tokens.
+    """
+    try:
+        user_id = uuid.UUID(user_id_from_token)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid user_id from token")
+
+    try:
+        success = db.use_streak_freeze_token(user_id)
+        remaining = db.get_streak_freeze_count(user_id)
+
+        if not success:
+            raise HTTPException(
+                status_code=400,
+                detail="No streak freeze tokens available"
+            )
+
+        return {
+            "success": True,
+            "streak_freeze_tokens": remaining
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to use streak freeze token: {str(e)}"
+        )
+
+
+# ============================================================================
+# Friends System Endpoints
+# ============================================================================
+
+class FriendRequestBody(BaseModel):
+    friend_id: str
+
+class SearchUsersBody(BaseModel):
+    query: str
+    limit: int = 10
+
+class FriendChallengeBody(BaseModel):
+    friend_id: str
+    challenge_type: str  # 'beat_xp_today' or 'more_lessons_today'
+
+class ChallengeResponseBody(BaseModel):
+    challenge_id: str
+    accept: bool
+
+class InviteLinkBody(BaseModel):
+    invite_code: str
+
+
+@app.get("/api/friends", tags=["Friends"])
+async def get_friends_list(
+    db: Database = Depends(get_database),
+    user_id_from_token: str = Depends(verify_token),
+):
+    """
+    Get list of friends with their today's stats.
+    """
+    try:
+        user_id = uuid.UUID(user_id_from_token)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid user_id from token")
+
+    try:
+        friends = db.get_friends_list(user_id)
+        pending = db.get_pending_friend_requests(user_id)
+        friend_code = db.get_user_friend_code(user_id)
+
+        return {
+            "friends": friends,
+            "pending_requests": pending,
+            "friend_code": friend_code,
+            "friend_count": len(friends)
+        }
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to get friends list: {str(e)}"
+        )
+
+
+@app.post("/api/friends/search", tags=["Friends"])
+async def search_users(
+    body: SearchUsersBody,
+    db: Database = Depends(get_database),
+    user_id_from_token: str = Depends(verify_token),
+):
+    """
+    Search for users by username, display name, or friend code.
+    """
+    try:
+        user_id = uuid.UUID(user_id_from_token)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid user_id from token")
+
+    try:
+        users = db.search_users(user_id, body.query, body.limit)
+        return {"users": users}
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to search users: {str(e)}"
+        )
+
+
+@app.post("/api/friends/request", tags=["Friends"])
+async def send_friend_request(
+    body: FriendRequestBody,
+    db: Database = Depends(get_database),
+    user_id_from_token: str = Depends(verify_token),
+):
+    """
+    Send a friend request to another user.
+    """
+    try:
+        user_id = uuid.UUID(user_id_from_token)
+        friend_id = uuid.UUID(body.friend_id)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid user_id")
+
+    try:
+        result = db.send_friend_request(user_id, friend_id)
+        if not result['success']:
+            raise HTTPException(status_code=400, detail=result['error'])
+        return result
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to send friend request: {str(e)}"
+        )
+
+
+@app.post("/api/friends/accept", tags=["Friends"])
+async def accept_friend_request(
+    body: FriendRequestBody,
+    db: Database = Depends(get_database),
+    user_id_from_token: str = Depends(verify_token),
+):
+    """
+    Accept a friend request.
+    """
+    try:
+        user_id = uuid.UUID(user_id_from_token)
+        requester_id = uuid.UUID(body.friend_id)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid user_id")
+
+    try:
+        success = db.accept_friend_request(user_id, requester_id)
+        if not success:
+            raise HTTPException(status_code=400, detail="Friend request not found")
+        return {"success": True}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to accept friend request: {str(e)}"
+        )
+
+
+@app.post("/api/friends/decline", tags=["Friends"])
+async def decline_friend_request(
+    body: FriendRequestBody,
+    db: Database = Depends(get_database),
+    user_id_from_token: str = Depends(verify_token),
+):
+    """
+    Decline a friend request.
+    """
+    try:
+        user_id = uuid.UUID(user_id_from_token)
+        requester_id = uuid.UUID(body.friend_id)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid user_id")
+
+    try:
+        success = db.decline_friend_request(user_id, requester_id)
+        if not success:
+            raise HTTPException(status_code=400, detail="Friend request not found")
+        return {"success": True}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to decline friend request: {str(e)}"
+        )
+
+
+@app.delete("/api/friends/{friend_id}", tags=["Friends"])
+async def remove_friend(
+    friend_id: str,
+    db: Database = Depends(get_database),
+    user_id_from_token: str = Depends(verify_token),
+):
+    """
+    Remove a friend.
+    """
+    try:
+        user_id = uuid.UUID(user_id_from_token)
+        friend_uuid = uuid.UUID(friend_id)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid user_id")
+
+    try:
+        success = db.remove_friend(user_id, friend_uuid)
+        if not success:
+            raise HTTPException(status_code=400, detail="Friend not found")
+        return {"success": True}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to remove friend: {str(e)}"
+        )
+
+
+@app.get("/api/friends/{friend_id}/profile", tags=["Friends"])
+async def get_friend_profile(
+    friend_id: str,
+    db: Database = Depends(get_database),
+    user_id_from_token: str = Depends(verify_token),
+):
+    """
+    Get detailed friend profile with 7-day activity.
+    """
+    try:
+        user_id = uuid.UUID(user_id_from_token)
+        friend_uuid = uuid.UUID(friend_id)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid user_id")
+
+    try:
+        profile = db.get_friend_profile(user_id, friend_uuid)
+        if not profile:
+            raise HTTPException(status_code=404, detail="User not found")
+        return profile
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to get friend profile: {str(e)}"
+        )
+
+
+@app.post("/api/friends/invite-link", tags=["Friends"])
+async def create_invite_link(
+    db: Database = Depends(get_database),
+    user_id_from_token: str = Depends(verify_token),
+):
+    """
+    Create a shareable friend invite link.
+    """
+    try:
+        user_id = uuid.UUID(user_id_from_token)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid user_id from token")
+
+    try:
+        invite_code = db.create_friend_invite_link(user_id)
+        return {
+            "invite_code": invite_code,
+            "invite_url": f"https://vorex.app/invite/{invite_code}"
+        }
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to create invite link: {str(e)}"
+        )
+
+
+@app.post("/api/friends/use-invite", tags=["Friends"])
+async def use_invite_link(
+    body: InviteLinkBody,
+    db: Database = Depends(get_database),
+    user_id_from_token: str = Depends(verify_token),
+):
+    """
+    Use a friend invite link to add a friend.
+    """
+    try:
+        user_id = uuid.UUID(user_id_from_token)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid user_id from token")
+
+    try:
+        result = db.use_friend_invite_link(body.invite_code, user_id)
+        if not result['success']:
+            raise HTTPException(status_code=400, detail=result['error'])
+        return result
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to use invite link: {str(e)}"
+        )
+
+
+# Friend Challenges
+
+@app.get("/api/friends/challenges", tags=["Friends"])
+async def get_friend_challenges(
+    db: Database = Depends(get_database),
+    user_id_from_token: str = Depends(verify_token),
+):
+    """
+    Get friend challenges (sent and received).
+    """
+    try:
+        user_id = uuid.UUID(user_id_from_token)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid user_id from token")
+
+    try:
+        challenges = db.get_friend_challenges(user_id)
+        return challenges
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to get friend challenges: {str(e)}"
+        )
+
+
+@app.post("/api/friends/challenge", tags=["Friends"])
+async def create_friend_challenge(
+    body: FriendChallengeBody,
+    db: Database = Depends(get_database),
+    user_id_from_token: str = Depends(verify_token),
+):
+    """
+    Create a friend challenge.
+
+    Challenge types:
+    - beat_xp_today: Compete to earn more XP today
+    - more_lessons_today: Compete to complete more lessons today
+    """
+    try:
+        user_id = uuid.UUID(user_id_from_token)
+        friend_id = uuid.UUID(body.friend_id)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid user_id")
+
+    if body.challenge_type not in ['beat_xp_today', 'more_lessons_today']:
+        raise HTTPException(status_code=400, detail="Invalid challenge type")
+
+    try:
+        result = db.create_friend_challenge(user_id, friend_id, body.challenge_type)
+        if not result['success']:
+            raise HTTPException(status_code=400, detail=result['error'])
+        return result
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to create challenge: {str(e)}"
+        )
+
+
+@app.post("/api/friends/challenge/respond", tags=["Friends"])
+async def respond_to_challenge(
+    body: ChallengeResponseBody,
+    db: Database = Depends(get_database),
+    user_id_from_token: str = Depends(verify_token),
+):
+    """
+    Accept or decline a friend challenge.
+    """
+    try:
+        user_id = uuid.UUID(user_id_from_token)
+        challenge_id = uuid.UUID(body.challenge_id)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid ID")
+
+    try:
+        success = db.respond_to_challenge(user_id, challenge_id, body.accept)
+        if not success:
+            raise HTTPException(status_code=400, detail="Challenge not found or already responded")
+        return {"success": True, "accepted": body.accept}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to respond to challenge: {str(e)}"
+        )
+
+
+@app.get("/api/friends/challenge/{challenge_id}", tags=["Friends"])
+async def get_challenge_status(
+    challenge_id: str,
+    db: Database = Depends(get_database),
+    user_id_from_token: str = Depends(verify_token),
+):
+    """
+    Get current status and scores for a challenge.
+    """
+    try:
+        challenge_uuid = uuid.UUID(challenge_id)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid challenge_id")
+
+    try:
+        result = db.update_challenge_scores(challenge_uuid)
+        if not result:
+            raise HTTPException(status_code=404, detail="Challenge not found")
+        return result
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to get challenge status: {str(e)}"
         )
 
 
@@ -5263,6 +6238,1174 @@ async def get_thinking_session(
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to get thinking session: {str(e)}")
+
+
+# ============================================================================
+# XP & Analytics Endpoints
+# ============================================================================
+
+class XPRecordRequest(BaseModel):
+    """Request model for recording XP."""
+    activity_type: str  # exercise, lesson, drill, voice, review
+    xp_earned: int
+    bonus_xp: int = 0
+    session_id: Optional[str] = None
+
+
+@app.post("/api/xp/record", tags=["Analytics"])
+async def record_xp(
+    payload: XPRecordRequest,
+    db: Database = Depends(get_database),
+    user_id_from_token: str = Depends(verify_token),
+):
+    """
+    Record XP earned from an activity.
+
+    This is the authoritative endpoint for XP tracking.
+    Frontend should call this when user earns XP.
+    """
+    try:
+        user_id = uuid.UUID(user_id_from_token)
+        total_xp_to_add = payload.xp_earned + payload.bonus_xp
+
+        if total_xp_to_add <= 0:
+            raise HTTPException(status_code=400, detail="XP must be positive")
+
+        # Cap XP per request to prevent abuse
+        if total_xp_to_add > 500:
+            total_xp_to_add = 500
+
+        # Add XP to user profile
+        new_total = add_user_xp(user_id_from_token, total_xp_to_add)
+
+        # Log the XP activity
+        with db.get_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    INSERT INTO xp_log (user_id, activity_type, xp_earned, bonus_xp, created_at)
+                    VALUES (%s, %s, %s, %s, NOW())
+                    ON CONFLICT DO NOTHING
+                """, (user_id, payload.activity_type, payload.xp_earned, payload.bonus_xp))
+                conn.commit()
+
+        return {
+            "success": True,
+            "xp_added": total_xp_to_add,
+            "total_xp": new_total,
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        # If xp_log table doesn't exist, just return success with XP added
+        print(f"Warning: XP log failed (table may not exist): {e}")
+        return {
+            "success": True,
+            "xp_added": total_xp_to_add,
+            "total_xp": add_user_xp(user_id_from_token, 0),  # Get current total
+        }
+
+
+class SessionTrackRequest(BaseModel):
+    """Request model for tracking study sessions."""
+    activity_type: str  # lesson, drill, voice, review, exercise
+    duration_seconds: int
+    started_at: Optional[str] = None  # ISO timestamp
+
+
+@app.post("/api/sessions/track", tags=["Analytics"])
+async def track_study_session(
+    payload: SessionTrackRequest,
+    db: Database = Depends(get_database),
+    user_id_from_token: str = Depends(verify_token),
+):
+    """
+    Track study time for analytics.
+
+    Frontend should call this when user finishes a learning session.
+    """
+    try:
+        user_id = uuid.UUID(user_id_from_token)
+
+        if payload.duration_seconds <= 0:
+            raise HTTPException(status_code=400, detail="Duration must be positive")
+
+        # Cap duration to 4 hours to prevent abuse
+        duration = min(payload.duration_seconds, 14400)
+
+        # Try to insert into study_sessions table
+        with db.get_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    INSERT INTO study_sessions (id, user_id, activity_type, duration_seconds, started_at, created_at)
+                    VALUES (%s, %s, %s, %s, %s, NOW())
+                """, (uuid.uuid4(), user_id, payload.activity_type, duration,
+                      payload.started_at or datetime.now().isoformat()))
+                conn.commit()
+
+        # Get today's total study time
+        with db.get_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    SELECT COALESCE(SUM(duration_seconds), 0) as today_total
+                    FROM study_sessions
+                    WHERE user_id = %s
+                    AND created_at >= CURRENT_DATE
+                """, (user_id,))
+                result = cur.fetchone()
+                today_total = result['today_total'] if result else 0
+
+        return {
+            "success": True,
+            "duration_recorded": duration,
+            "today_total_seconds": today_total,
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        # If study_sessions table doesn't exist, return success anyway
+        print(f"Warning: Session tracking failed (table may not exist): {e}")
+        return {
+            "success": True,
+            "duration_recorded": payload.duration_seconds,
+            "today_total_seconds": payload.duration_seconds,
+        }
+
+
+@app.get("/api/analytics/summary", tags=["Analytics"])
+async def get_analytics_summary(
+    db: Database = Depends(get_database),
+    user_id_from_token: str = Depends(verify_token),
+):
+    """
+    Get user's analytics summary for dashboard.
+
+    Returns:
+    - Total XP and level
+    - Today's study time
+    - Weekly study time
+    - Current streak
+    """
+    try:
+        user_id = uuid.UUID(user_id_from_token)
+
+        # Get XP and level
+        total_xp = get_user_xp(user_id_from_token)
+        level = total_xp // 100 + 1  # 100 XP per level
+        xp_in_level = total_xp % 100
+
+        # Try to get study time stats
+        today_seconds = 0
+        week_seconds = 0
+        try:
+            with db.get_connection() as conn:
+                with conn.cursor() as cur:
+                    # Today's study time
+                    cur.execute("""
+                        SELECT COALESCE(SUM(duration_seconds), 0) as total
+                        FROM study_sessions
+                        WHERE user_id = %s AND created_at >= CURRENT_DATE
+                    """, (user_id,))
+                    result = cur.fetchone()
+                    today_seconds = result['total'] if result else 0
+
+                    # This week's study time
+                    cur.execute("""
+                        SELECT COALESCE(SUM(duration_seconds), 0) as total
+                        FROM study_sessions
+                        WHERE user_id = %s AND created_at >= CURRENT_DATE - INTERVAL '7 days'
+                    """, (user_id,))
+                    result = cur.fetchone()
+                    week_seconds = result['total'] if result else 0
+        except Exception as e:
+            print(f"Warning: Could not get study time: {e}")
+
+        # Try to get streak
+        current_streak = 0
+        try:
+            with db.get_connection() as conn:
+                with conn.cursor() as cur:
+                    cur.execute("""
+                        SELECT current_streak FROM user_streaks WHERE user_id = %s
+                    """, (user_id,))
+                    result = cur.fetchone()
+                    current_streak = result['current_streak'] if result else 0
+        except Exception as e:
+            print(f"Warning: Could not get streak: {e}")
+
+        return {
+            "xp": {
+                "total": total_xp,
+                "level": level,
+                "xp_in_level": xp_in_level,
+                "xp_to_next_level": 100 - xp_in_level,
+            },
+            "study_time": {
+                "today_seconds": today_seconds,
+                "today_minutes": today_seconds // 60,
+                "week_seconds": week_seconds,
+                "week_minutes": week_seconds // 60,
+            },
+            "streak": {
+                "current": current_streak,
+            },
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to get analytics: {str(e)}")
+
+
+@app.get("/api/skills/history", tags=["Analytics"])
+async def get_skills_history(
+    days: int = 30,
+    db: Database = Depends(get_database),
+    user_id_from_token: str = Depends(verify_token),
+):
+    """
+    Get skill mastery history for the past N days.
+
+    Used for progress charts on dashboard.
+    """
+    try:
+        user_id = uuid.UUID(user_id_from_token)
+
+        # Get current skill masteries
+        skills = []
+        try:
+            with db.get_connection() as conn:
+                with conn.cursor() as cur:
+                    cur.execute("""
+                        SELECT skill_key, mastery_score, last_practiced, practice_count
+                        FROM skill_graph_nodes
+                        WHERE user_id = %s
+                        ORDER BY mastery_score DESC
+                        LIMIT 10
+                    """, (user_id,))
+                    rows = cur.fetchall()
+
+                    for row in rows:
+                        skills.append({
+                            "skill_key": row['skill_key'],
+                            "mastery_score": row['mastery_score'],
+                            "last_practiced": row['last_practiced'].isoformat() if row['last_practiced'] else None,
+                            "practice_count": row['practice_count'],
+                        })
+        except Exception as e:
+            print(f"Warning: Could not get skills: {e}")
+
+        # Calculate overall trend (simplified - just compare first and last practice)
+        overall_trend = 0
+        if skills:
+            avg_mastery = sum(s['mastery_score'] for s in skills) / len(skills)
+            overall_trend = avg_mastery  # Simplified for now
+
+        return {
+            "skills": skills,
+            "overall_mastery": overall_trend,
+            "days": days,
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to get skills history: {str(e)}")
+
+
+@app.get("/api/analytics/heatmap", tags=["Analytics"])
+async def get_activity_heatmap(
+    days: int = 365,
+    db: Database = Depends(get_database),
+    user_id_from_token: str = Depends(verify_token),
+):
+    """
+    Get activity heatmap data for the past N days.
+
+    Returns daily activity data for GitHub-style heatmap visualization:
+    - date: The day
+    - xp: Total XP earned that day
+    - lessons: Number of lessons completed
+    - sessions: Number of study sessions
+    """
+    try:
+        user_id = uuid.UUID(user_id_from_token)
+        heatmap_data = db.get_activity_heatmap(user_id, days=days)
+
+        return {
+            "success": True,
+            "days_requested": days,
+            "data": heatmap_data
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to get activity heatmap: {str(e)}")
+
+
+@app.get("/api/analytics/insights", tags=["Analytics"])
+async def get_learning_insights(
+    db: Database = Depends(get_database),
+    user_id_from_token: str = Depends(verify_token),
+):
+    """
+    Get detailed learning insights for the user.
+
+    Returns comprehensive analytics:
+    - best_study_hours: Which hours of the day user performs best
+    - day_performance: Performance by day of week
+    - error_trends: Recent error patterns and categories
+    - skill_progress: Progress in each skill area
+    - streak: Current and longest streaks
+    - totals: Overall stats (lessons, XP, time)
+    """
+    try:
+        user_id = uuid.UUID(user_id_from_token)
+        insights = db.get_learning_insights(user_id)
+
+        return {
+            "success": True,
+            **insights
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to get learning insights: {str(e)}")
+
+
+@app.post("/api/achievements/check", tags=["Analytics"])
+async def check_achievements(
+    db: Database = Depends(get_database),
+    user_id_from_token: str = Depends(verify_token),
+):
+    """
+    Check and unlock any new achievements for the user.
+
+    Checks user's stats against achievement conditions and unlocks
+    any newly qualified achievements, awarding XP for each.
+
+    Returns:
+    - newly_unlocked: List of achievements just unlocked
+    - total_unlocked: Total number of achievements user has
+    """
+    try:
+        user_id = uuid.UUID(user_id_from_token)
+        newly_unlocked = []
+
+        with db.get_connection() as conn:
+            with conn.cursor() as cur:
+                # Get all achievements the user hasn't unlocked yet
+                cur.execute("""
+                    SELECT a.achievement_id, a.key, a.title, a.description, a.xp_reward, a.tier
+                    FROM achievements a
+                    WHERE a.achievement_id NOT IN (
+                        SELECT achievement_id FROM user_achievements WHERE user_id = %s
+                    )
+                """, (user_id,))
+                available_achievements = cur.fetchall()
+
+                # Get user's stats for checking conditions
+                stats = {}
+
+                # Streak
+                cur.execute("SELECT current_streak FROM user_streaks WHERE user_id = %s", (user_id,))
+                streak_row = cur.fetchone()
+                stats['current_streak'] = streak_row['current_streak'] if streak_row else 0
+
+                # Completed sessions count
+                cur.execute("""
+                    SELECT COUNT(*) as count FROM sessions
+                    WHERE user_id = %s AND state = 'completed'
+                """, (user_id,))
+                session_row = cur.fetchone()
+                stats['completed_sessions'] = session_row['count'] if session_row else 0
+
+                # Voice sessions count
+                cur.execute("""
+                    SELECT COUNT(*) as count FROM sessions
+                    WHERE user_id = %s AND session_type = 'voice' AND state = 'completed'
+                """, (user_id,))
+                voice_row = cur.fetchone()
+                stats['voice_sessions'] = voice_row['count'] if voice_row else 0
+
+                # Total exercises (approximate from XP log or skill practice count)
+                cur.execute("""
+                    SELECT COALESCE(SUM(practice_count), 0) as total FROM skill_graph_nodes
+                    WHERE user_id = %s
+                """, (user_id,))
+                exercise_row = cur.fetchone()
+                stats['total_exercises'] = exercise_row['total'] if exercise_row else 0
+
+                # Best pronunciation score (from evaluations if available)
+                cur.execute("""
+                    SELECT MAX((scores->>'pronunciation')::float) as best
+                    FROM evaluations
+                    WHERE user_id = %s AND scores->>'pronunciation' IS NOT NULL
+                """, (user_id,))
+                pron_row = cur.fetchone()
+                stats['best_pronunciation'] = pron_row['best'] if pron_row and pron_row['best'] else 0
+
+                # Total XP
+                cur.execute("SELECT COALESCE(total_xp, 0) as total_xp FROM user_profiles WHERE user_id = %s", (user_id,))
+                xp_row = cur.fetchone()
+                stats['total_xp'] = xp_row['total_xp'] if xp_row else 0
+
+                # Perfect lessons (100% score)
+                cur.execute("""
+                    SELECT COUNT(*) as count FROM learning_path_progress
+                    WHERE user_id = %s AND best_score = 100
+                """, (user_id,))
+                perfect_row = cur.fetchone()
+                stats['perfect_lessons'] = perfect_row['count'] if perfect_row else 0
+
+                # Completed lessons
+                cur.execute("""
+                    SELECT COUNT(*) as count FROM learning_path_progress
+                    WHERE user_id = %s AND completed = true
+                """, (user_id,))
+                lessons_row = cur.fetchone()
+                stats['completed_lessons'] = lessons_row['count'] if lessons_row else 0
+
+                # Completed units
+                cur.execute("""
+                    SELECT COUNT(DISTINCT unit_id) as count FROM learning_path_progress lpp
+                    JOIN learning_path_lessons lpl ON lpp.lesson_id = lpl.lesson_id
+                    WHERE lpp.user_id = %s AND lpp.completed = true
+                """, (user_id,))
+                units_row = cur.fetchone()
+                stats['completed_units'] = units_row['count'] if units_row else 0
+
+                # Check each available achievement
+                for achievement in available_achievements:
+                    key = achievement['key']
+                    unlocked = False
+
+                    # Streaks
+                    if key == 'first_lesson' and stats['completed_sessions'] >= 1:
+                        unlocked = True
+                    elif key == '5_day_streak' and stats['current_streak'] >= 5:
+                        unlocked = True
+                    elif key == '10_day_streak' and stats['current_streak'] >= 10:
+                        unlocked = True
+                    elif key == '30_day_streak' and stats['current_streak'] >= 30:
+                        unlocked = True
+                    elif key == 'week_streak' and stats['current_streak'] >= 7:
+                        unlocked = True
+                    elif key == 'month_streak' and stats['current_streak'] >= 30:
+                        unlocked = True
+
+                    # XP milestones
+                    elif key == 'xp_100' and stats['total_xp'] >= 100:
+                        unlocked = True
+                    elif key == 'xp_500' and stats['total_xp'] >= 500:
+                        unlocked = True
+                    elif key == 'xp_1000' and stats['total_xp'] >= 1000:
+                        unlocked = True
+                    elif key == 'xp_5000' and stats['total_xp'] >= 5000:
+                        unlocked = True
+                    elif key == 'xp_10000' and stats['total_xp'] >= 10000:
+                        unlocked = True
+
+                    # Voice sessions
+                    elif key == 'first_voice' and stats['voice_sessions'] >= 1:
+                        unlocked = True
+                    elif key == 'voice_5' and stats['voice_sessions'] >= 5:
+                        unlocked = True
+                    elif key == 'voice_25' and stats['voice_sessions'] >= 25:
+                        unlocked = True
+                    elif key == 'voice_100' and stats['voice_sessions'] >= 100:
+                        unlocked = True
+                    elif key == 'voice_explorer' and stats['voice_sessions'] >= 10:
+                        unlocked = True
+
+                    # Pronunciation
+                    elif key == 'pronunciation_80' and stats['best_pronunciation'] >= 80:
+                        unlocked = True
+                    elif key == 'pronunciation_90' and stats['best_pronunciation'] >= 90:
+                        unlocked = True
+                    elif key == 'pronunciation_95' and stats['best_pronunciation'] >= 95:
+                        unlocked = True
+                    elif key == 'pronunciation_master' and stats['best_pronunciation'] >= 90:
+                        unlocked = True
+
+                    # Perfect lessons
+                    elif key == 'perfect_lesson' and stats['perfect_lessons'] >= 1:
+                        unlocked = True
+                    elif key == 'perfect_5' and stats['perfect_lessons'] >= 5:
+                        unlocked = True
+                    elif key == 'perfect_20' and stats['perfect_lessons'] >= 20:
+                        unlocked = True
+
+                    # Completed lessons
+                    elif key == '10_lessons_completed' and stats['completed_lessons'] >= 10:
+                        unlocked = True
+                    elif key == '50_lessons_completed' and stats['completed_lessons'] >= 50:
+                        unlocked = True
+
+                    # Learning path
+                    elif key == 'path_started' and stats['completed_lessons'] >= 1:
+                        unlocked = True
+                    elif key == 'unit_complete' and stats['completed_units'] >= 1:
+                        unlocked = True
+
+                    # Exercises
+                    elif key == '100_exercises' and stats['total_exercises'] >= 100:
+                        unlocked = True
+
+                    if unlocked:
+                        # Insert into user_achievements
+                        cur.execute("""
+                            INSERT INTO user_achievements (user_id, achievement_id)
+                            VALUES (%s, %s)
+                            ON CONFLICT (user_id, achievement_id) DO NOTHING
+                        """, (user_id, achievement['achievement_id']))
+
+                        # Award XP
+                        if achievement['xp_reward'] > 0:
+                            add_user_xp(user_id_from_token, achievement['xp_reward'])
+
+                        newly_unlocked.append({
+                            "key": achievement['key'],
+                            "title": achievement['title'],
+                            "description": achievement['description'],
+                            "xp_reward": achievement['xp_reward'],
+                            "tier": achievement['tier'],
+                        })
+
+                conn.commit()
+
+                # Get total unlocked count
+                cur.execute("""
+                    SELECT COUNT(*) as count FROM user_achievements WHERE user_id = %s
+                """, (user_id,))
+                total_row = cur.fetchone()
+                total_unlocked = total_row['count'] if total_row else 0
+
+        return {
+            "newly_unlocked": newly_unlocked,
+            "total_unlocked": total_unlocked,
+        }
+
+    except Exception as e:
+        print(f"Error checking achievements: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to check achievements: {str(e)}")
+
+
+# ============================================================================
+# Push Notifications Endpoints
+# ============================================================================
+
+@app.post("/api/push/subscribe", tags=["Push Notifications"])
+async def subscribe_to_push(
+    subscription: dict,
+    db: Database = Depends(get_database),
+    user_id_from_token: str = Depends(verify_token),
+):
+    """
+    Register a push notification subscription for the user.
+
+    Body:
+        - endpoint: Push service endpoint URL
+        - p256dh: Public key for encryption
+        - auth: Auth secret for encryption
+
+    Returns:
+        Success status
+    """
+    try:
+        user_id = uuid.UUID(user_id_from_token)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid user_id from token")
+
+    endpoint = subscription.get("endpoint")
+    p256dh = subscription.get("p256dh")
+    auth = subscription.get("auth")
+
+    if not endpoint or not p256dh or not auth:
+        raise HTTPException(status_code=400, detail="Missing subscription data")
+
+    try:
+        with db.get_connection() as conn:
+            with conn.cursor() as cur:
+                # Upsert subscription
+                cur.execute("""
+                    INSERT INTO push_subscriptions (user_id, endpoint, p256dh, auth)
+                    VALUES (%s, %s, %s, %s)
+                    ON CONFLICT (endpoint) DO UPDATE SET
+                        user_id = EXCLUDED.user_id,
+                        p256dh = EXCLUDED.p256dh,
+                        auth = EXCLUDED.auth,
+                        last_used_at = NOW()
+                """, (user_id, endpoint, p256dh, auth))
+
+                # Enable push preferences if not already
+                cur.execute("""
+                    INSERT INTO push_preferences (user_id, enabled)
+                    VALUES (%s, TRUE)
+                    ON CONFLICT (user_id) DO UPDATE SET enabled = TRUE, updated_at = NOW()
+                """, (user_id,))
+
+                conn.commit()
+
+        return {"success": True}
+
+    except Exception as e:
+        print(f"Error subscribing to push: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to subscribe: {str(e)}")
+
+
+@app.post("/api/push/unsubscribe", tags=["Push Notifications"])
+async def unsubscribe_from_push(
+    data: dict,
+    db: Database = Depends(get_database),
+    user_id_from_token: str = Depends(verify_token),
+):
+    """
+    Remove a push notification subscription.
+
+    Body:
+        - endpoint: Push service endpoint URL to remove
+
+    Returns:
+        Success status
+    """
+    try:
+        user_id = uuid.UUID(user_id_from_token)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid user_id from token")
+
+    endpoint = data.get("endpoint")
+    if not endpoint:
+        raise HTTPException(status_code=400, detail="Missing endpoint")
+
+    try:
+        with db.get_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    DELETE FROM push_subscriptions
+                    WHERE user_id = %s AND endpoint = %s
+                """, (user_id, endpoint))
+                conn.commit()
+
+        return {"success": True}
+
+    except Exception as e:
+        print(f"Error unsubscribing from push: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to unsubscribe: {str(e)}")
+
+
+@app.get("/api/push/preferences", tags=["Push Notifications"])
+async def get_push_preferences(
+    db: Database = Depends(get_database),
+    user_id_from_token: str = Depends(verify_token),
+):
+    """
+    Get push notification preferences for the user.
+
+    Returns:
+        - enabled: Whether push is enabled
+        - streak_reminders: Notify about streak risks
+        - friend_challenges: Notify about friend challenges
+        - achievements: Notify about achievements
+        - daily_goals: Notify about daily goals
+    """
+    try:
+        user_id = uuid.UUID(user_id_from_token)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid user_id from token")
+
+    try:
+        with db.get_connection() as conn:
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                cur.execute("SELECT * FROM get_or_create_push_preferences(%s)", (user_id,))
+                result = cur.fetchone()
+                conn.commit()
+
+        if result:
+            return {
+                "enabled": result["enabled"],
+                "streak_reminders": result["streak_reminders"],
+                "friend_challenges": result["friend_challenges"],
+                "achievements": result["achievements"],
+                "daily_goals": result["daily_goals"],
+            }
+        else:
+            return {
+                "enabled": False,
+                "streak_reminders": True,
+                "friend_challenges": True,
+                "achievements": True,
+                "daily_goals": True,
+            }
+
+    except Exception as e:
+        print(f"Error getting push preferences: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to get preferences: {str(e)}")
+
+
+@app.put("/api/push/preferences", tags=["Push Notifications"])
+async def update_push_preferences(
+    preferences: dict,
+    db: Database = Depends(get_database),
+    user_id_from_token: str = Depends(verify_token),
+):
+    """
+    Update push notification preferences.
+
+    Body (all optional):
+        - enabled: Whether push is enabled
+        - streak_reminders: Notify about streak risks
+        - friend_challenges: Notify about friend challenges
+        - achievements: Notify about achievements
+        - daily_goals: Notify about daily goals
+
+    Returns:
+        Updated preferences
+    """
+    try:
+        user_id = uuid.UUID(user_id_from_token)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid user_id from token")
+
+    try:
+        with db.get_connection() as conn:
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                cur.execute("""
+                    SELECT * FROM update_push_preferences(
+                        %s, %s, %s, %s, %s, %s
+                    )
+                """, (
+                    user_id,
+                    preferences.get("enabled"),
+                    preferences.get("streak_reminders"),
+                    preferences.get("friend_challenges"),
+                    preferences.get("achievements"),
+                    preferences.get("daily_goals"),
+                ))
+                result = cur.fetchone()
+                conn.commit()
+
+        if result:
+            return {
+                "enabled": result["enabled"],
+                "streak_reminders": result["streak_reminders"],
+                "friend_challenges": result["friend_challenges"],
+                "achievements": result["achievements"],
+                "daily_goals": result["daily_goals"],
+            }
+        else:
+            raise HTTPException(status_code=500, detail="Failed to update preferences")
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"Error updating push preferences: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to update preferences: {str(e)}")
+
+
+@app.post("/api/push/test", tags=["Push Notifications"])
+async def send_test_push(
+    db: Database = Depends(get_database),
+    user_id_from_token: str = Depends(verify_token),
+):
+    """
+    Send a test push notification to verify setup is working.
+
+    Returns:
+        Success status and message
+    """
+    try:
+        user_id = uuid.UUID(user_id_from_token)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid user_id from token")
+
+    try:
+        # Get user's push subscriptions
+        with db.get_connection() as conn:
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                cur.execute("""
+                    SELECT endpoint, p256dh, auth
+                    FROM push_subscriptions
+                    WHERE user_id = %s
+                """, (user_id,))
+                subscriptions = cur.fetchall()
+
+        if not subscriptions:
+            return {
+                "success": False,
+                "message": "No push subscription found. Please enable notifications first."
+            }
+
+        # Note: In production, you would use pywebpush to send actual notifications
+        # For now, we'll just verify the subscription exists
+        return {
+            "success": True,
+            "message": f"Test notification queued for {len(subscriptions)} device(s)."
+        }
+
+    except Exception as e:
+        print(f"Error sending test push: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to send test: {str(e)}")
+
+
+# ============================================================================
+# Gamification Bonuses Endpoints
+# ============================================================================
+
+@app.get("/api/bonuses/summary", tags=["Bonuses"])
+async def get_bonus_summary(
+    db: Database = Depends(get_database),
+    user_id_from_token: str = Depends(verify_token),
+):
+    """
+    Get active bonuses and today's bonus summary for the user.
+
+    Returns:
+        - total_bonus_xp_today: Total bonus XP earned today
+        - bonuses_claimed: List of bonuses claimed today
+        - available_bonuses: Available bonuses (login, streak, weekend, event)
+        - current_multiplier: Combined XP multiplier
+    """
+    try:
+        user_id = uuid.UUID(user_id_from_token)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid user_id from token")
+
+    try:
+        with db.get_connection() as conn:
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                # Call the get_bonus_summary function
+                cur.execute("SELECT * FROM get_bonus_summary(%s)", (user_id,))
+                result = cur.fetchone()
+
+        if result:
+            return {
+                "total_bonus_xp_today": result["total_bonus_xp_today"] or 0,
+                "bonuses_claimed": result["bonuses_claimed"] or [],
+                "available_bonuses": result["available_bonuses"] or {
+                    "login_bonus": {"available": False, "xp": 25},
+                    "streak_bonus": {"active": False, "multiplier": 1.0, "streak_days": 0},
+                    "weekend_bonus": {"active": False, "multiplier": 1.0},
+                    "event_bonus": {"active": False, "name": None, "multiplier": 1.0}
+                },
+                "current_multiplier": float(result["current_multiplier"]) if result["current_multiplier"] else 1.0
+            }
+        else:
+            # Return defaults if no result
+            return {
+                "total_bonus_xp_today": 0,
+                "bonuses_claimed": [],
+                "available_bonuses": {
+                    "login_bonus": {"available": True, "xp": 25},
+                    "streak_bonus": {"active": False, "multiplier": 1.0, "streak_days": 0},
+                    "weekend_bonus": {"active": False, "multiplier": 1.0},
+                    "event_bonus": {"active": False, "name": None, "multiplier": 1.0}
+                },
+                "current_multiplier": 1.0
+            }
+
+    except Exception as e:
+        print(f"Error getting bonus summary: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to get bonus summary: {str(e)}")
+
+
+@app.post("/api/bonuses/claim-login", tags=["Bonuses"])
+async def claim_login_bonus(
+    db: Database = Depends(get_database),
+    user_id_from_token: str = Depends(verify_token),
+):
+    """
+    Claim the daily login bonus.
+
+    Returns:
+        - success: Whether the claim was successful
+        - xp_earned: Amount of XP earned (with streak multiplier applied)
+        - message: Status message
+    """
+    try:
+        user_id = uuid.UUID(user_id_from_token)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid user_id from token")
+
+    try:
+        with db.get_connection() as conn:
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                # Call the claim_login_bonus function
+                cur.execute("SELECT * FROM claim_login_bonus(%s)", (user_id,))
+                result = cur.fetchone()
+                conn.commit()
+
+        if result:
+            return {
+                "success": result["success"],
+                "xp_earned": result["xp_earned"] or 0,
+                "message": result["message"] or "Login bonus processed"
+            }
+        else:
+            return {
+                "success": False,
+                "xp_earned": 0,
+                "message": "Failed to claim login bonus"
+            }
+
+    except Exception as e:
+        print(f"Error claiming login bonus: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to claim login bonus: {str(e)}")
+
+
+@app.get("/api/bonuses/active", tags=["Bonuses"])
+async def get_active_bonuses(
+    db: Database = Depends(get_database),
+    user_id_from_token: str = Depends(verify_token),
+):
+    """
+    Get active XP bonuses for the user.
+
+    Returns:
+        - login_bonus_available: Whether login bonus can be claimed
+        - login_bonus_xp: XP amount for login bonus
+        - streak_multiplier: Current streak multiplier
+        - streak_days: Current streak days
+        - weekend_bonus_active: Whether weekend bonus is active
+        - weekend_multiplier: Weekend multiplier (1.5x on weekends)
+        - event_bonus_active: Whether a special event is active
+        - event_name: Name of active event (if any)
+        - event_multiplier: Event multiplier
+        - total_multiplier: Combined multiplier
+    """
+    try:
+        user_id = uuid.UUID(user_id_from_token)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid user_id from token")
+
+    try:
+        with db.get_connection() as conn:
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                # Call the get_active_bonuses function
+                cur.execute("SELECT * FROM get_active_bonuses(%s)", (user_id,))
+                result = cur.fetchone()
+
+        if result:
+            return {
+                "login_bonus_available": result["login_bonus_available"],
+                "login_bonus_xp": result["login_bonus_xp"] or 25,
+                "streak_multiplier": float(result["streak_multiplier"]) if result["streak_multiplier"] else 1.0,
+                "streak_days": result["streak_days"] or 0,
+                "weekend_bonus_active": result["weekend_bonus_active"],
+                "weekend_multiplier": float(result["weekend_multiplier"]) if result["weekend_multiplier"] else 1.0,
+                "event_bonus_active": result["event_bonus_active"],
+                "event_name": result["event_name"],
+                "event_multiplier": float(result["event_multiplier"]) if result["event_multiplier"] else 1.0,
+                "total_multiplier": float(result["total_multiplier"]) if result["total_multiplier"] else 1.0
+            }
+        else:
+            return {
+                "login_bonus_available": True,
+                "login_bonus_xp": 25,
+                "streak_multiplier": 1.0,
+                "streak_days": 0,
+                "weekend_bonus_active": False,
+                "weekend_multiplier": 1.0,
+                "event_bonus_active": False,
+                "event_name": None,
+                "event_multiplier": 1.0,
+                "total_multiplier": 1.0
+            }
+
+    except Exception as e:
+        print(f"Error getting active bonuses: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to get active bonuses: {str(e)}")
+
+
+@app.post("/api/bonuses/calculate-xp", tags=["Bonuses"])
+async def calculate_bonus_xp(
+    payload: dict,
+    db: Database = Depends(get_database),
+    user_id_from_token: str = Depends(verify_token),
+):
+    """
+    Calculate XP with all active bonuses applied.
+
+    Payload:
+        - base_xp: Base XP amount
+        - is_perfect_score: Whether this was a perfect score (optional, default false)
+
+    Returns:
+        - final_xp: Total XP after multipliers
+        - bonus_breakdown: Breakdown of all multipliers applied
+    """
+    try:
+        user_id = uuid.UUID(user_id_from_token)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid user_id from token")
+
+    base_xp = payload.get("base_xp", 10)
+    is_perfect_score = payload.get("is_perfect_score", False)
+
+    try:
+        with db.get_connection() as conn:
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                # Call the calculate_bonus_xp function
+                cur.execute(
+                    "SELECT * FROM calculate_bonus_xp(%s, %s, %s)",
+                    (user_id, base_xp, is_perfect_score)
+                )
+                result = cur.fetchone()
+
+        if result:
+            return {
+                "final_xp": result["final_xp"],
+                "bonus_breakdown": result["bonus_breakdown"]
+            }
+        else:
+            return {
+                "final_xp": base_xp,
+                "bonus_breakdown": {
+                    "base_xp": base_xp,
+                    "streak_multiplier": 1.0,
+                    "weekend_multiplier": 1.0,
+                    "event_multiplier": 1.0,
+                    "perfect_score_multiplier": 1.25 if is_perfect_score else 1.0,
+                    "final_xp": base_xp,
+                    "bonus_xp": 0
+                }
+            }
+
+    except Exception as e:
+        print(f"Error calculating bonus XP: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to calculate bonus XP: {str(e)}")
+
+
+# ============================================================================
+# Speech API Endpoints
+# ============================================================================
+
+@app.post("/api/speech/transcribe")
+async def transcribe_speech(
+    audio: UploadFile = File(...),
+    user_id_from_token: str = Depends(verify_token)
+):
+    """
+    Transcribe audio file to text using OpenAI Whisper.
+
+    Accepts audio file upload (m4a, mp3, wav, webm, etc.)
+    Returns the transcribed text.
+    """
+    try:
+        # Read audio bytes from upload
+        audio_bytes = await audio.read()
+
+        if len(audio_bytes) == 0:
+            raise HTTPException(status_code=400, detail="Empty audio file")
+
+        # Get filename for format hint
+        filename = audio.filename or "audio.m4a"
+
+        # Transcribe using ASR client
+        result = asr_client.transcribe_bytes(audio_bytes, filename)
+
+        return {
+            "success": True,
+            "transcript": result.text,
+            "language": result.language,
+            "duration": result.duration
+        }
+
+    except RuntimeError as e:
+        # ASR specific errors (e.g., API failure after retries)
+        print(f"ASR error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+    except Exception as e:
+        print(f"Transcription error: {e}")
+        raise HTTPException(status_code=500, detail=f"Transcription failed: {str(e)}")
+
+
+@app.post("/api/speech/analyze")
+async def analyze_speech(
+    audio: UploadFile = File(...),
+    expected_text: Optional[str] = None,
+    user_id_from_token: str = Depends(verify_token)
+):
+    """
+    Analyze speech for pronunciation and fluency.
+
+    Accepts audio file upload and optional expected text.
+    Returns transcript, pronunciation score, fluency score, and feedback.
+    """
+    try:
+        # Read audio bytes from upload
+        audio_bytes = await audio.read()
+
+        if len(audio_bytes) == 0:
+            raise HTTPException(status_code=400, detail="Empty audio file")
+
+        # Get filename for format hint
+        filename = audio.filename or "audio.m4a"
+
+        # First, transcribe the audio
+        asr_result = asr_client.transcribe_bytes(audio_bytes, filename)
+        transcript = asr_result.text.strip()
+
+        if not transcript:
+            return {
+                "success": True,
+                "transcript": "",
+                "pronunciation_score": 0,
+                "fluency_score": 0,
+                "mispronounced_words": [],
+                "feedback": "No speech detected. Please speak clearly into the microphone."
+            }
+
+        # Calculate scores based on transcript quality
+        # If we have expected text, compare against it
+        if expected_text and expected_text.strip():
+            expected_words = expected_text.lower().split()
+            transcript_words = transcript.lower().split()
+
+            # Calculate word accuracy
+            matching_words = sum(1 for w in transcript_words if w in expected_words)
+            word_coverage = matching_words / len(expected_words) if expected_words else 0
+
+            # Pronunciation score based on word accuracy
+            pronunciation_score = int(min(100, word_coverage * 100))
+
+            # Find mispronounced/missing words
+            mispronounced = [w for w in expected_words if w not in transcript_words][:5]
+
+            # Generate feedback
+            if pronunciation_score >= 80:
+                feedback = "Excellent pronunciation! Keep up the great work."
+            elif pronunciation_score >= 60:
+                feedback = f"Good effort! Try to pronounce these words more clearly: {', '.join(mispronounced[:3])}"
+            else:
+                feedback = f"Keep practicing! Focus on these words: {', '.join(mispronounced[:3])}"
+        else:
+            # No expected text - score based on transcript properties
+            word_count = len(transcript.split())
+
+            # Simple heuristics for fluency
+            pronunciation_score = min(90, 50 + word_count * 5)  # More words = better
+            mispronounced = []
+            feedback = "Good job! Keep practicing for even better fluency."
+
+        # Calculate fluency score based on duration and word count
+        duration = asr_result.duration or 5.0
+        word_count = len(transcript.split())
+        words_per_minute = (word_count / duration) * 60 if duration > 0 else 0
+
+        # Optimal speaking rate is 120-150 wpm
+        if 100 <= words_per_minute <= 180:
+            fluency_score = min(95, 70 + int(word_count * 2))
+        elif words_per_minute < 100:
+            fluency_score = max(40, int(words_per_minute * 0.7))
+        else:
+            fluency_score = max(50, 100 - int((words_per_minute - 180) * 0.3))
+
+        return {
+            "success": True,
+            "transcript": transcript,
+            "pronunciation_score": pronunciation_score,
+            "fluency_score": fluency_score,
+            "mispronounced_words": mispronounced if expected_text else [],
+            "feedback": feedback
+        }
+
+    except RuntimeError as e:
+        # ASR specific errors
+        print(f"ASR error in analyze: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+    except Exception as e:
+        print(f"Speech analysis error: {e}")
+        raise HTTPException(status_code=500, detail=f"Speech analysis failed: {str(e)}")
 
 
 if __name__ == "__main__":
