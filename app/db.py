@@ -558,6 +558,309 @@ class Database:
                 )
                 return cur.fetchone()
 
+    # Session Analytics
+
+    def save_session_result(
+        self,
+        user_id: uuid.UUID,
+        session_type: str,
+        duration_seconds: int,
+        words_spoken: int = 0,
+        pronunciation_score: float = 0.0,
+        fluency_score: float = 0.0,
+        grammar_score: float = 0.0,
+        topics: Optional[List[str]] = None,
+        vocabulary_learned: Optional[List[str]] = None,
+        areas_to_improve: Optional[List[str]] = None,
+        metadata: Optional[Dict[str, Any]] = None
+    ) -> Dict[str, Any]:
+        """
+        Save a completed session result with analytics data.
+
+        Args:
+            user_id: User UUID
+            session_type: Type of session (conversation, pronunciation, roleplay)
+            duration_seconds: Duration in seconds
+            words_spoken: Number of words spoken
+            pronunciation_score: Pronunciation score (0-100)
+            fluency_score: Fluency score (0-100)
+            grammar_score: Grammar score (0-100)
+            topics: List of topics covered
+            vocabulary_learned: List of vocabulary items learned
+            areas_to_improve: List of areas needing improvement
+            metadata: Additional session-specific data
+
+        Returns:
+            Created session result dict
+        """
+        with self.get_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    INSERT INTO session_results (
+                        user_id, session_type, duration_seconds, words_spoken,
+                        pronunciation_score, fluency_score, grammar_score,
+                        topics, vocabulary_learned, areas_to_improve, metadata
+                    )
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    RETURNING *
+                """, (
+                    user_id,
+                    session_type,
+                    duration_seconds,
+                    words_spoken,
+                    pronunciation_score,
+                    fluency_score,
+                    grammar_score,
+                    topics or [],
+                    vocabulary_learned or [],
+                    areas_to_improve or [],
+                    psycopg.types.json.Json(metadata or {})
+                ))
+                return cur.fetchone()
+
+    def get_session_history(
+        self,
+        user_id: uuid.UUID,
+        session_type: Optional[str] = None,
+        limit: int = 20,
+        offset: int = 0
+    ) -> List[Dict[str, Any]]:
+        """
+        Get user's session history with optional filtering.
+
+        Args:
+            user_id: User UUID
+            session_type: Optional filter by session type
+            limit: Maximum number of results
+            offset: Offset for pagination
+
+        Returns:
+            List of session result dicts
+        """
+        with self.get_connection() as conn:
+            with conn.cursor() as cur:
+                if session_type:
+                    cur.execute("""
+                        SELECT *
+                        FROM session_results
+                        WHERE user_id = %s AND session_type = %s
+                        ORDER BY created_at DESC
+                        LIMIT %s OFFSET %s
+                    """, (user_id, session_type, limit, offset))
+                else:
+                    cur.execute("""
+                        SELECT *
+                        FROM session_results
+                        WHERE user_id = %s
+                        ORDER BY created_at DESC
+                        LIMIT %s OFFSET %s
+                    """, (user_id, limit, offset))
+                return cur.fetchall()
+
+    def get_session_stats(
+        self,
+        user_id: uuid.UUID,
+        period: str = 'week'
+    ) -> Dict[str, Any]:
+        """
+        Get aggregated session statistics for a user.
+
+        Args:
+            user_id: User UUID
+            period: Time period ('week' or 'month')
+
+        Returns:
+            Dict with aggregated stats including:
+            - total_sessions: Total number of sessions
+            - total_duration: Total duration in seconds
+            - avg_pronunciation: Average pronunciation score
+            - avg_fluency: Average fluency score
+            - avg_grammar: Average grammar score
+            - sessions_by_type: Breakdown by session type
+            - improvement_trends: Score trends over time
+            - common_topics: Most common topics
+            - areas_to_improve: Aggregated weak areas
+        """
+        days = 7 if period == 'week' else 30
+
+        with self.get_connection() as conn:
+            with conn.cursor() as cur:
+                # Get aggregate stats
+                cur.execute("""
+                    SELECT
+                        COUNT(*)::INTEGER as total_sessions,
+                        COALESCE(SUM(duration_seconds), 0)::INTEGER as total_duration,
+                        COALESCE(AVG(pronunciation_score), 0)::FLOAT as avg_pronunciation,
+                        COALESCE(AVG(fluency_score), 0)::FLOAT as avg_fluency,
+                        COALESCE(AVG(grammar_score), 0)::FLOAT as avg_grammar,
+                        COALESCE(SUM(words_spoken), 0)::INTEGER as total_words_spoken
+                    FROM session_results
+                    WHERE user_id = %s
+                        AND created_at >= NOW() - INTERVAL '%s days'
+                """, (user_id, days))
+                stats = cur.fetchone()
+
+                # Get sessions by type
+                cur.execute("""
+                    SELECT
+                        session_type,
+                        COUNT(*)::INTEGER as count,
+                        COALESCE(AVG(duration_seconds), 0)::INTEGER as avg_duration
+                    FROM session_results
+                    WHERE user_id = %s
+                        AND created_at >= NOW() - INTERVAL '%s days'
+                    GROUP BY session_type
+                """, (user_id, days))
+                sessions_by_type = {
+                    row['session_type']: {
+                        'count': row['count'],
+                        'avg_duration': row['avg_duration']
+                    }
+                    for row in cur.fetchall()
+                }
+
+                # Get daily score trends for improvement analysis
+                cur.execute("""
+                    SELECT
+                        DATE(created_at) as date,
+                        COALESCE(AVG(pronunciation_score), 0)::FLOAT as avg_pronunciation,
+                        COALESCE(AVG(fluency_score), 0)::FLOAT as avg_fluency,
+                        COALESCE(AVG(grammar_score), 0)::FLOAT as avg_grammar
+                    FROM session_results
+                    WHERE user_id = %s
+                        AND created_at >= NOW() - INTERVAL '%s days'
+                    GROUP BY DATE(created_at)
+                    ORDER BY date ASC
+                """, (user_id, days))
+                trends = [
+                    {
+                        'date': row['date'].isoformat() if row['date'] else None,
+                        'pronunciation': row['avg_pronunciation'],
+                        'fluency': row['avg_fluency'],
+                        'grammar': row['avg_grammar']
+                    }
+                    for row in cur.fetchall()
+                ]
+
+                # Get most common topics
+                cur.execute("""
+                    SELECT UNNEST(topics) as topic, COUNT(*) as count
+                    FROM session_results
+                    WHERE user_id = %s
+                        AND created_at >= NOW() - INTERVAL '%s days'
+                        AND topics IS NOT NULL
+                    GROUP BY topic
+                    ORDER BY count DESC
+                    LIMIT 10
+                """, (user_id, days))
+                common_topics = [
+                    {'topic': row['topic'], 'count': row['count']}
+                    for row in cur.fetchall()
+                ]
+
+                # Get aggregated areas to improve
+                cur.execute("""
+                    SELECT UNNEST(areas_to_improve) as area, COUNT(*) as count
+                    FROM session_results
+                    WHERE user_id = %s
+                        AND created_at >= NOW() - INTERVAL '%s days'
+                        AND areas_to_improve IS NOT NULL
+                    GROUP BY area
+                    ORDER BY count DESC
+                    LIMIT 10
+                """, (user_id, days))
+                areas_to_improve = [
+                    {'area': row['area'], 'count': row['count']}
+                    for row in cur.fetchall()
+                ]
+
+                return {
+                    'total_sessions': stats['total_sessions'] if stats else 0,
+                    'total_duration': stats['total_duration'] if stats else 0,
+                    'total_words_spoken': stats['total_words_spoken'] if stats else 0,
+                    'avg_pronunciation': stats['avg_pronunciation'] if stats else 0.0,
+                    'avg_fluency': stats['avg_fluency'] if stats else 0.0,
+                    'avg_grammar': stats['avg_grammar'] if stats else 0.0,
+                    'sessions_by_type': sessions_by_type,
+                    'improvement_trends': trends,
+                    'common_topics': common_topics,
+                    'areas_to_improve': areas_to_improve
+                }
+
+    def get_warmup_content(
+        self,
+        user_id: uuid.UUID
+    ) -> Dict[str, Any]:
+        """
+        Get personalized warmup content based on user's recent session performance.
+
+        Args:
+            user_id: User UUID
+
+        Returns:
+            Dict with warmup content:
+            - practice_phrases: List of phrases to practice
+            - focus_areas: List of areas to focus on
+            - quick_quiz: List of quiz questions
+            - last_session_summary: Summary of last session
+        """
+        with self.get_connection() as conn:
+            with conn.cursor() as cur:
+                # Get last session
+                cur.execute("""
+                    SELECT *
+                    FROM session_results
+                    WHERE user_id = %s
+                    ORDER BY created_at DESC
+                    LIMIT 1
+                """, (user_id,))
+                last_session = cur.fetchone()
+
+                # Get weak areas from recent sessions
+                cur.execute("""
+                    SELECT UNNEST(areas_to_improve) as area, COUNT(*) as frequency
+                    FROM session_results
+                    WHERE user_id = %s
+                        AND created_at >= NOW() - INTERVAL '7 days'
+                        AND areas_to_improve IS NOT NULL
+                    GROUP BY area
+                    ORDER BY frequency DESC
+                    LIMIT 5
+                """, (user_id,))
+                weak_areas = [row['area'] for row in cur.fetchall()]
+
+                # Get vocabulary that needs reinforcement
+                cur.execute("""
+                    SELECT UNNEST(vocabulary_learned) as word, COUNT(*) as seen
+                    FROM session_results
+                    WHERE user_id = %s
+                        AND created_at >= NOW() - INTERVAL '7 days'
+                        AND vocabulary_learned IS NOT NULL
+                    GROUP BY word
+                    ORDER BY seen ASC
+                    LIMIT 10
+                """, (user_id,))
+                vocab_to_practice = [row['word'] for row in cur.fetchall()]
+
+                warmup_content = {
+                    'focus_areas': weak_areas,
+                    'vocabulary_review': vocab_to_practice,
+                    'last_session_summary': None
+                }
+
+                if last_session:
+                    warmup_content['last_session_summary'] = {
+                        'session_type': last_session['session_type'],
+                        'duration_seconds': last_session['duration_seconds'],
+                        'pronunciation_score': last_session['pronunciation_score'],
+                        'fluency_score': last_session['fluency_score'],
+                        'grammar_score': last_session['grammar_score'],
+                        'areas_to_improve': last_session['areas_to_improve'],
+                        'created_at': last_session['created_at'].isoformat() if last_session['created_at'] else None
+                    }
+
+                return warmup_content
+
     # Streaks
 
     def get_user_streak(self, user_id: uuid.UUID) -> Optional[Dict[str, Any]]:
@@ -1860,6 +2163,43 @@ class Database:
                 cur.execute("""
                     SELECT * FROM get_recent_conversations(%s, %s)
                 """, (user_id, limit))
+                return cur.fetchall()
+
+    def get_session_conversations(
+        self,
+        session_id: uuid.UUID,
+        limit: int = 20
+    ) -> List[Dict[str, Any]]:
+        """
+        Get conversation turns for a specific session.
+        This is used to maintain context within a single conversation session.
+
+        Args:
+            session_id: Session UUID
+            limit: Maximum number of turns to return
+
+        Returns:
+            List of conversation turn dicts ordered by turn_number
+        """
+        with self.get_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    SELECT
+                        turn_id,
+                        user_id,
+                        session_id,
+                        turn_number,
+                        user_message,
+                        tutor_response,
+                        context_type,
+                        context_id,
+                        metadata,
+                        created_at
+                    FROM conversation_memory
+                    WHERE session_id = %s
+                    ORDER BY turn_number ASC
+                    LIMIT %s
+                """, (session_id, limit))
                 return cur.fetchall()
 
     def get_conversation_context(

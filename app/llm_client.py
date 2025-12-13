@@ -694,6 +694,18 @@ class LLMClient:
 
         learner_profile = "\n".join(profile_parts) + error_section + skills_section
 
+        # Build conversation history section for continuity
+        conversation_section = ""
+        if context.get("has_conversation_history") and context.get("recent_conversation_summary"):
+            conv_lines = []
+            for conv in context["recent_conversation_summary"]:
+                if conv.get('user_said'):
+                    conv_lines.append(f"  Learner: {conv['user_said']}")
+                if conv.get('tutor_said'):
+                    conv_lines.append(f"  You ({character}): {conv['tutor_said']}")
+            if conv_lines:
+                conversation_section = "\n\n=== PREVIOUS CONVERSATION IN THIS SESSION ===\n" + "\n".join(conv_lines) + "\n(CRITICAL: Remember what was said! Reference previous context naturally.)"
+
         message = f"""SCENARIO CONTEXT:
 Your Character: {character}
 Situation: {scenario.situation_description}
@@ -702,6 +714,7 @@ Success Criteria: {scenario.success_criteria}
 
 === LEARNER PROFILE ===
 {learner_profile}
+{conversation_section}
 
 Current Turn: {turn_number}
 Learner said: "{user_text}"

@@ -171,6 +171,67 @@ class UpdateVoicePreferencesRequest(BaseModel):
     microphone_sensitivity: Optional[float] = None
 
 
+class SessionResultRequest(BaseModel):
+    """Request model for saving a session result."""
+    session_type: str = Field(..., description="Type of session: conversation, pronunciation, or roleplay")
+    duration_seconds: int = Field(..., ge=0, description="Duration in seconds")
+    words_spoken: int = Field(default=0, ge=0, description="Number of words spoken")
+    pronunciation_score: float = Field(default=0.0, ge=0, le=100, description="Pronunciation score (0-100)")
+    fluency_score: float = Field(default=0.0, ge=0, le=100, description="Fluency score (0-100)")
+    grammar_score: float = Field(default=0.0, ge=0, le=100, description="Grammar score (0-100)")
+    topics: List[str] = Field(default_factory=list, description="Topics covered in the session")
+    vocabulary_learned: List[str] = Field(default_factory=list, description="Vocabulary items learned")
+    areas_to_improve: List[str] = Field(default_factory=list, description="Areas needing improvement")
+    metadata: Optional[Dict[str, Any]] = Field(default=None, description="Additional session metadata")
+
+
+class SessionResultResponse(BaseModel):
+    """Response model for a session result."""
+    session_result_id: uuid.UUID
+    user_id: uuid.UUID
+    session_type: str
+    duration_seconds: int
+    words_spoken: int
+    pronunciation_score: float
+    fluency_score: float
+    grammar_score: float
+    topics: List[str]
+    vocabulary_learned: List[str]
+    areas_to_improve: List[str]
+    metadata: Optional[Dict[str, Any]]
+    created_at: datetime
+    updated_at: datetime
+
+
+class SessionHistoryResponse(BaseModel):
+    """Response model for session history."""
+    sessions: List[SessionResultResponse]
+    total: int
+    limit: int
+    offset: int
+
+
+class SessionStatsResponse(BaseModel):
+    """Response model for session statistics."""
+    total_sessions: int
+    total_duration: int
+    total_words_spoken: int
+    avg_pronunciation: float
+    avg_fluency: float
+    avg_grammar: float
+    sessions_by_type: Dict[str, Dict[str, int]]
+    improvement_trends: List[Dict[str, Any]]
+    common_topics: List[Dict[str, Any]]
+    areas_to_improve: List[Dict[str, Any]]
+
+
+class WarmupContentResponse(BaseModel):
+    """Response model for warmup content."""
+    focus_areas: List[str]
+    vocabulary_review: List[str]
+    last_session_summary: Optional[Dict[str, Any]]
+
+
 class HealthResponse(BaseModel):
     """Response model for health check."""
     status: str
@@ -2181,6 +2242,203 @@ async def get_srs_stats(
         raise HTTPException(
             status_code=500,
             detail=f"Failed to get SRS stats: {str(e)}"
+        )
+
+
+# ============================================================================
+# Session Analytics Endpoints
+# ============================================================================
+
+@app.post("/api/sessions/save", response_model=SessionResultResponse, tags=["Sessions"])
+async def save_session_result(
+    request: SessionResultRequest,
+    db: Database = Depends(get_database),
+    user_id_from_token: str = Depends(verify_token),
+):
+    """
+    Save a completed session result with analytics data.
+
+    Records detailed session information including scores, topics covered,
+    vocabulary learned, and areas needing improvement for personalized feedback.
+
+    Args:
+        request: Session result data including type, duration, scores, and metadata
+
+    Returns:
+        Saved session result with generated ID and timestamps
+    """
+    try:
+        user_id = uuid.UUID(user_id_from_token)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid user_id from token")
+
+    # Validate session type
+    valid_session_types = ['conversation', 'pronunciation', 'roleplay']
+    if request.session_type not in valid_session_types:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid session_type. Must be one of: {', '.join(valid_session_types)}"
+        )
+
+    try:
+        result = db.save_session_result(
+            user_id=user_id,
+            session_type=request.session_type,
+            duration_seconds=request.duration_seconds,
+            words_spoken=request.words_spoken,
+            pronunciation_score=request.pronunciation_score,
+            fluency_score=request.fluency_score,
+            grammar_score=request.grammar_score,
+            topics=request.topics,
+            vocabulary_learned=request.vocabulary_learned,
+            areas_to_improve=request.areas_to_improve,
+            metadata=request.metadata
+        )
+
+        return SessionResultResponse(**result)
+
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to save session result: {str(e)}"
+        )
+
+
+@app.get("/api/sessions/history", response_model=SessionHistoryResponse, tags=["Sessions"])
+async def get_session_history(
+    session_type: Optional[str] = None,
+    limit: int = 20,
+    offset: int = 0,
+    db: Database = Depends(get_database),
+    user_id_from_token: str = Depends(verify_token),
+):
+    """
+    Get user's session history with optional filtering.
+
+    Returns a paginated list of completed sessions with their analytics data.
+    Useful for tracking progress over time and reviewing past performance.
+
+    Args:
+        session_type: Optional filter by session type (conversation, pronunciation, roleplay)
+        limit: Maximum number of results (default: 20, max: 100)
+        offset: Offset for pagination (default: 0)
+
+    Returns:
+        List of session results with pagination metadata
+    """
+    try:
+        user_id = uuid.UUID(user_id_from_token)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid user_id from token")
+
+    # Validate and limit the query
+    limit = min(max(1, limit), 100)
+    offset = max(0, offset)
+
+    if session_type:
+        valid_session_types = ['conversation', 'pronunciation', 'roleplay']
+        if session_type not in valid_session_types:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Invalid session_type. Must be one of: {', '.join(valid_session_types)}"
+            )
+
+    try:
+        sessions = db.get_session_history(
+            user_id=user_id,
+            session_type=session_type,
+            limit=limit,
+            offset=offset
+        )
+
+        # Convert to response models
+        session_responses = [SessionResultResponse(**session) for session in sessions]
+
+        return SessionHistoryResponse(
+            sessions=session_responses,
+            total=len(session_responses),
+            limit=limit,
+            offset=offset
+        )
+
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to get session history: {str(e)}"
+        )
+
+
+@app.get("/api/sessions/stats", response_model=SessionStatsResponse, tags=["Sessions"])
+async def get_session_stats(
+    period: str = 'week',
+    db: Database = Depends(get_database),
+    user_id_from_token: str = Depends(verify_token),
+):
+    """
+    Get aggregated session statistics for the authenticated user.
+
+    Provides comprehensive analytics including total sessions, average scores,
+    improvement trends, common topics, and areas needing improvement.
+
+    Args:
+        period: Time period for stats ('week' or 'month', default: 'week')
+
+    Returns:
+        Aggregated statistics with trends and insights
+    """
+    try:
+        user_id = uuid.UUID(user_id_from_token)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid user_id from token")
+
+    # Validate period
+    if period not in ['week', 'month']:
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid period. Must be 'week' or 'month'"
+        )
+
+    try:
+        stats = db.get_session_stats(user_id=user_id, period=period)
+        return SessionStatsResponse(**stats)
+
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to get session stats: {str(e)}"
+        )
+
+
+@app.get("/api/sessions/warmup", response_model=WarmupContentResponse, tags=["Sessions"])
+async def get_warmup_content(
+    db: Database = Depends(get_database),
+    user_id_from_token: str = Depends(verify_token),
+):
+    """
+    Get personalized warmup content based on recent session performance.
+
+    Analyzes the user's last session and recent weak areas to provide
+    targeted warmup exercises, vocabulary review, and focus areas.
+
+    Returns:
+        Personalized warmup content including:
+        - focus_areas: Areas to concentrate on based on recent performance
+        - vocabulary_review: Words that need reinforcement
+        - last_session_summary: Summary of the most recent session
+    """
+    try:
+        user_id = uuid.UUID(user_id_from_token)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid user_id from token")
+
+    try:
+        warmup_content = db.get_warmup_content(user_id=user_id)
+        return WarmupContentResponse(**warmup_content)
+
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to get warmup content: {str(e)}"
         )
 
 
@@ -7527,6 +7785,199 @@ class TTSSynthesizeRequest(BaseModel):
     """Request body for TTS synthesis."""
     text: str = Field(..., description="Text to synthesize to speech")
     voice: Optional[str] = Field(None, description="Voice to use (alloy, echo, fable, onyx, nova, shimmer)")
+
+
+@app.post("/api/speech/analyze-pronunciation")
+async def analyze_pronunciation(
+    audio: UploadFile = File(...),
+    target_text: str = Form(...),
+    db: Database = Depends(get_database),
+    user_id_from_token: str = Depends(verify_token)
+):
+    """
+    Analyze pronunciation with detailed phoneme-level feedback.
+
+    This endpoint provides comprehensive pronunciation analysis including:
+    - Transcription using Whisper
+    - Word-level accuracy comparison
+    - Phoneme-level scoring using IPA
+    - Specific pronunciation tips for problem sounds
+    - Overall fluency metrics
+
+    Args:
+        audio: Audio file (WAV/MP3/M4A/WebM)
+        target_text: The text the user was trying to pronounce
+
+    Returns:
+        Detailed pronunciation analysis with scores, feedback, and improvement tips
+    """
+    try:
+        # Read audio bytes from upload
+        audio_bytes = await audio.read()
+
+        if len(audio_bytes) == 0:
+            raise HTTPException(status_code=400, detail="Empty audio file")
+
+        if not target_text or not target_text.strip():
+            raise HTTPException(status_code=400, detail="target_text is required")
+
+        # Get filename for format hint
+        filename = audio.filename or "audio.m4a"
+
+        # Transcribe the audio using Whisper with word-level timestamps
+        asr_result = asr_client.transcribe_bytes(audio_bytes, filename)
+        transcript = asr_result.text.strip()
+
+        # Use the pronunciation scorer for detailed analysis
+        from app.pronunciation_scorer import PronunciationScorer
+        from app.pronunciation_analyzer import PronunciationAnalyzer
+
+        scorer = PronunciationScorer()
+
+        # Save audio to temp file for scorer (it expects a file path)
+        import tempfile
+        with tempfile.NamedTemporaryFile(delete=False, suffix=f".{filename.split('.')[-1]}") as tmp_file:
+            tmp_file.write(audio_bytes)
+            tmp_path = tmp_file.name
+
+        try:
+            # Get pronunciation scoring
+            scoring_result = scorer.score_audio(tmp_path, target_text)
+
+            # Get enhanced analysis with personalized feedback
+            analyzer = PronunciationAnalyzer(db=db)
+
+            # Build phoneme analysis from word scores
+            phoneme_analysis = []
+            for word_score in scoring_result.get("word_scores", []):
+                word = word_score.get("word", "")
+                score = word_score.get("score", 0)
+                status = word_score.get("status", "unknown")
+                problem_phonemes = word_score.get("problem_phonemes", [])
+
+                # Map status to our response format
+                status_map = {
+                    "good": "correct",
+                    "needs_work": "close",
+                    "focus": "incorrect",
+                    "missing": "incorrect"
+                }
+
+                for phoneme in problem_phonemes:
+                    phoneme_analysis.append({
+                        "word": word,
+                        "phoneme": phoneme,
+                        "status": status_map.get(status, "incorrect"),
+                        "confidence": score / 100.0,
+                        "expected_ipa": phoneme,
+                        "actual_ipa": phoneme  # Simplification - we'd need more complex analysis for actual IPA
+                    })
+
+            # Build word scores with issues
+            word_scores = []
+            for word_score in scoring_result.get("word_scores", []):
+                word = word_score.get("word", "")
+                score = word_score.get("score", 0)
+                tip = word_score.get("tip", "")
+                problem_phonemes = word_score.get("problem_phonemes", [])
+
+                issues = []
+                if tip:
+                    issues.append(tip)
+                if problem_phonemes:
+                    issues.append(f"Problem sounds: {', '.join(problem_phonemes)}")
+
+                word_scores.append({
+                    "word": word,
+                    "score": score,
+                    "issues": issues
+                })
+
+            # Calculate overall scores
+            overall_score = scoring_result.get("overall_score", 0)
+
+            # Calculate fluency score based on speech metrics
+            duration = asr_result.duration or 5.0
+            word_count = len(transcript.split())
+            words_per_minute = (word_count / duration) * 60 if duration > 0 else 0
+
+            # Optimal speaking rate is 120-150 wpm for non-native speakers
+            if 100 <= words_per_minute <= 180:
+                fluency_score = min(95, 70 + int(word_count * 2))
+            elif words_per_minute < 100:
+                fluency_score = max(40, int(words_per_minute * 0.7))
+            else:
+                fluency_score = max(50, 100 - int((words_per_minute - 180) * 0.3))
+
+            # Generate comprehensive feedback
+            feedback_parts = []
+
+            if overall_score >= 90:
+                feedback_parts.append("Excellent pronunciation! Your speech is very clear.")
+            elif overall_score >= 75:
+                feedback_parts.append("Good pronunciation overall. A few sounds need refinement.")
+            elif overall_score >= 60:
+                feedback_parts.append("Your pronunciation is understandable. Focus on the tips below to improve.")
+            else:
+                feedback_parts.append("Keep practicing! Pronunciation takes time. Work on the specific sounds highlighted below.")
+
+            # Add tips from scorer
+            tips = scoring_result.get("tips", [])
+            if tips:
+                feedback_parts.append(f"\nKey areas to work on: {tips[0]}")
+
+            feedback = " ".join(feedback_parts)
+
+            # Store the attempt in the database
+            import psycopg
+            with db.get_connection() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """
+                        INSERT INTO pronunciation_attempts (user_id, phrase, phoneme_scores, overall_score)
+                        VALUES (%s, %s, %s, %s)
+                        """,
+                        (
+                            user_id_from_token,
+                            target_text,
+                            psycopg.types.json.Json([{
+                                "phoneme": p["phoneme"],
+                                "score": p["confidence"] * 100
+                            } for p in phoneme_analysis]),
+                            overall_score,
+                        ),
+                    )
+
+            return {
+                "success": True,
+                "transcript": transcript,
+                "overall_score": round(overall_score, 1),
+                "pronunciation_score": round(overall_score, 1),
+                "fluency_score": round(fluency_score, 1),
+                "phoneme_analysis": phoneme_analysis[:10],  # Limit to top 10
+                "word_scores": word_scores,
+                "feedback": feedback,
+                "words_per_minute": round(words_per_minute, 1),
+                "duration": round(duration, 2),
+                "word_count": word_count
+            }
+
+        finally:
+            # Clean up temp file
+            try:
+                os.remove(tmp_path)
+            except Exception:
+                pass
+
+    except RuntimeError as e:
+        # ASR specific errors
+        print(f"ASR error in pronunciation analysis: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+    except Exception as e:
+        import traceback
+        print(f"Pronunciation analysis error: {e}")
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"Pronunciation analysis failed: {str(e)}")
 
 
 @app.post("/api/speech/synthesize")
