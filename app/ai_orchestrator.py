@@ -5,10 +5,13 @@ Coordinates multiple AI services running in parallel for efficient processing:
 1. Ranking AI - Evaluates grammar, fluency, vocabulary
 2. Conversation AI - Generates persona-aware responses with full history
 3. Pronunciation AI - Analyzes phoneme accuracy (optional)
+
+Enhanced with User Language Profile for adaptive tutoring.
 """
 
 import asyncio
 import json
+import uuid
 from typing import Optional, Dict, Any, List
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -20,6 +23,11 @@ from app.audio_quality import (
     analyze_audio_quality_from_file,
     AudioQualityResult,
     should_penalize_pronunciation
+)
+from app.language_profile import (
+    LanguageProfileManager,
+    UserLanguageProfile,
+    analyze_errors_from_ranking
 )
 
 
@@ -110,10 +118,15 @@ class AIOrchestrator:
 
     This class runs multiple AI evaluations concurrently to minimize latency
     while maintaining accuracy across ranking, conversation, and pronunciation.
+
+    Enhanced with User Language Profile for adaptive tutoring - automatically
+    adjusts AI behavior based on user's specific weaknesses and learning history.
     """
 
-    def __init__(self):
+    def __init__(self, db=None):
         self.openai_client = None
+        self.db = db
+        self.profile_manager = LanguageProfileManager(db) if db else None
         self._initialize_clients()
 
     def _initialize_clients(self):
@@ -131,7 +144,8 @@ class AIOrchestrator:
         conversation_history: List[Dict[str, str]],
         persona: Optional[Dict[str, Any]] = None,
         include_ranking: bool = True,
-        include_pronunciation: bool = False
+        include_pronunciation: bool = False,
+        user_id: Optional[uuid.UUID] = None
     ) -> OrchestratorResult:
         """
         Process a user's voice turn with parallel AI execution.
@@ -142,10 +156,20 @@ class AIOrchestrator:
             persona: Optional persona/scenario config with system_prompt
             include_ranking: Whether to run ranking AI
             include_pronunciation: Whether to run pronunciation AI
+            user_id: Optional user UUID for language profile injection
 
         Returns:
             OrchestratorResult with all AI outputs combined
         """
+        # Load language profile if user_id provided
+        language_profile = None
+        prompt_injection = ""
+        if user_id and self.profile_manager:
+            try:
+                language_profile = self.profile_manager.get_profile(user_id)
+                prompt_injection = self.profile_manager.get_prompt_injection(user_id)
+            except Exception as e:
+                print(f"[AIOrchestrator] Failed to load language profile: {e}")
         # Step 1: Run ASR and audio quality analysis in parallel
         asr_task = asyncio.to_thread(
             asr_client.transcribe_bytes,
@@ -176,11 +200,12 @@ class AIOrchestrator:
         # Step 2: Run AI services in parallel
         tasks = []
 
-        # Always run conversation AI
+        # Always run conversation AI (with language profile injection)
         conversation_task = self._run_conversation_ai(
             transcript,
             conversation_history,
-            persona
+            persona,
+            prompt_injection=prompt_injection
         )
         tasks.append(("conversation", conversation_task))
 
@@ -218,10 +243,24 @@ class AIOrchestrator:
                 emotion="friendly"
             )
 
+        # Record errors from ranking result for language profile
+        ranking = result_map.get("ranking")
+        if ranking and user_id and self.profile_manager:
+            try:
+                # Convert to dict for error analysis
+                ranking_dict = ranking.to_dict()
+                analyze_errors_from_ranking(
+                    ranking_dict,
+                    user_id,
+                    self.profile_manager
+                )
+            except Exception as e:
+                print(f"[AIOrchestrator] Error recording to profile: {e}")
+
         return OrchestratorResult(
             transcript=transcript,
             response=conversation,
-            ranking=result_map.get("ranking"),
+            ranking=ranking,
             pronunciation=result_map.get("pronunciation"),
             audio_quality=audio_quality
         )
@@ -230,12 +269,14 @@ class AIOrchestrator:
         self,
         user_text: str,
         conversation_history: List[Dict[str, str]],
-        persona: Optional[Dict[str, Any]]
+        persona: Optional[Dict[str, Any]],
+        prompt_injection: str = ""
     ) -> ConversationResult:
         """
         Run the conversation AI with full message history.
 
         This uses proper OpenAI messages format with role-based turns.
+        Enhanced with language profile injection for adaptive tutoring.
         """
         if not self.openai_client:
             return ConversationResult(
@@ -248,6 +289,10 @@ class AIOrchestrator:
             system_prompt = persona["system_prompt"]
         else:
             system_prompt = self._get_default_system_prompt()
+
+        # Inject language profile for adaptive tutoring
+        if prompt_injection:
+            system_prompt = f"{system_prompt}\n\n{prompt_injection}"
 
         # Build messages array with PROPER format (not context dump!)
         messages = [{"role": "system", "content": system_prompt}]
@@ -491,7 +536,8 @@ def process_voice_turn_sync(
     conversation_history: List[Dict[str, str]],
     persona: Optional[Dict[str, Any]] = None,
     include_ranking: bool = True,
-    include_pronunciation: bool = False
+    include_pronunciation: bool = False,
+    user_id: Optional[uuid.UUID] = None
 ) -> OrchestratorResult:
     """
     Synchronous wrapper for process_user_turn.
@@ -503,6 +549,20 @@ def process_voice_turn_sync(
             conversation_history=conversation_history,
             persona=persona,
             include_ranking=include_ranking,
-            include_pronunciation=include_pronunciation
+            include_pronunciation=include_pronunciation,
+            user_id=user_id
         )
     )
+
+
+def create_orchestrator_with_db(db) -> AIOrchestrator:
+    """
+    Create an orchestrator with database connection for language profile support.
+
+    Args:
+        db: Database instance with get_connection() method
+
+    Returns:
+        AIOrchestrator with language profile support enabled
+    """
+    return AIOrchestrator(db=db)
