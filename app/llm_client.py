@@ -424,6 +424,77 @@ class LLMClient:
         self.client = None
         self._initialize_client()
 
+    def call_with_messages(
+        self,
+        messages: list,
+        model: Optional[str] = None,
+        temperature: float = 0.7,
+        max_tokens: int = 500
+    ) -> str:
+        """
+        Call LLM with proper messages array format.
+
+        This is the CORRECT way to pass conversation history - each turn
+        is a separate message with role (user/assistant/system).
+
+        Args:
+            messages: List of {"role": "system"|"user"|"assistant", "content": "..."}
+            model: Optional model override
+            temperature: Sampling temperature
+            max_tokens: Maximum tokens in response
+
+        Returns:
+            Raw response text from LLM
+        """
+        if not config.enable_llm or not self.client:
+            return '{"text": "I understood you!", "emotion": "friendly"}'
+
+        use_model = model or self.config.model
+
+        for attempt in range(self.config.retry_attempts):
+            try:
+                if self.provider == "openai":
+                    response = self.client.chat.completions.create(
+                        model=use_model,
+                        messages=messages,
+                        temperature=temperature,
+                        max_tokens=max_tokens,
+                        timeout=self.config.timeout
+                    )
+                    return response.choices[0].message.content
+
+                elif self.provider == "anthropic":
+                    # Extract system message for Anthropic
+                    system_msg = ""
+                    chat_messages = []
+                    for msg in messages:
+                        if msg["role"] == "system":
+                            system_msg = msg["content"]
+                        else:
+                            chat_messages.append(msg)
+
+                    response = self.client.messages.create(
+                        model=use_model,
+                        max_tokens=max_tokens,
+                        temperature=temperature,
+                        system=system_msg,
+                        messages=chat_messages,
+                        timeout=self.config.timeout
+                    )
+                    return response.content[0].text
+
+            except Exception as e:
+                if attempt < self.config.retry_attempts - 1:
+                    if config.debug_mode:
+                        print(f"⚠️  API call failed (attempt {attempt + 1}), retrying: {e}")
+                    time.sleep(self.config.retry_delay * (attempt + 1))
+                else:
+                    if config.debug_mode:
+                        print(f"❌ API call failed after {self.config.retry_attempts} attempts: {e}")
+                    return '{"text": "I understood you! Let me think about that.", "emotion": "thoughtful"}'
+
+        return '{"text": "I understood you!", "emotion": "friendly"}'
+
     def _initialize_client(self):
         """Initialize the appropriate API client."""
         if not self.config.api_key:
