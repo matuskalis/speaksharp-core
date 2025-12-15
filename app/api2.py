@@ -36,6 +36,15 @@ from app.exercises import EXERCISES, get_exercises_by_skill_key
 from app.thinking_engine import thinking_engine, ThinkingSession, ThinkingTurn
 from app.asr_client import asr_client
 from app.tts_client import tts_client
+from app.skill_unlocks import (
+    SkillUnlockManager, create_skill_manager_with_db,
+    SKILL_DEFINITIONS, UNLOCKABLE_CONTENT, ACHIEVEMENTS
+)
+from app.conversation_replay import (
+    ReplayManager, create_replay_manager_with_db,
+    ConversationReplayBuilder
+)
+from app.phoneme_analyzer import analyze_pronunciation_from_asr
 import random
 import io
 import time
@@ -7978,6 +7987,283 @@ async def analyze_pronunciation(
         print(f"Pronunciation analysis error: {e}")
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"Pronunciation analysis failed: {str(e)}")
+
+
+# ============================================================================
+# Skill Unlocks System Endpoints
+# ============================================================================
+
+# Global skill manager (will be initialized with db on first use)
+_skill_manager: Optional[SkillUnlockManager] = None
+
+def get_skill_manager(db: Database = Depends(get_database)) -> SkillUnlockManager:
+    """Get or create skill manager with database connection."""
+    global _skill_manager
+    if _skill_manager is None or _skill_manager.db is None:
+        _skill_manager = create_skill_manager_with_db(db)
+    return _skill_manager
+
+
+@app.get("/api/skills/profile", tags=["Skills"])
+async def get_skill_profile(
+    db: Database = Depends(get_database),
+    user_id_from_token: str = Depends(verify_token),
+):
+    """
+    Get user's complete skill profile including XP, levels, and progress.
+
+    Returns:
+        - total_xp: Total XP earned
+        - overall_level: User's overall level
+        - skills: Progress for each skill
+        - unlocked_content: IDs of unlocked content
+        - earned_achievements: IDs of earned achievements
+    """
+    try:
+        user_id = uuid.UUID(user_id_from_token)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid user_id from token")
+
+    try:
+        manager = get_skill_manager(db)
+        profile = manager.get_or_create_profile(str(user_id))
+        return profile.to_dict()
+    except Exception as e:
+        print(f"Error getting skill profile: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to get profile: {str(e)}")
+
+
+@app.post("/api/skills/xp", tags=["Skills"])
+async def award_skill_xp(
+    request: dict,
+    db: Database = Depends(get_database),
+    user_id_from_token: str = Depends(verify_token),
+):
+    """
+    Award XP to a skill after conversation/exercise completion.
+
+    Body:
+        - skill_id: The skill to award XP to (e.g., "grammar_tenses")
+        - xp_amount: Amount of XP to award
+        - successful: Whether the attempt was successful (affects accuracy)
+
+    Returns:
+        - xp_added: Actual XP added (may be capped)
+        - level_ups: Any level ups that occurred
+        - new_unlocks: Any new content unlocked
+        - new_achievements: Any new achievements earned
+    """
+    try:
+        user_id = uuid.UUID(user_id_from_token)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid user_id from token")
+
+    skill_id = request.get("skill_id")
+    xp_amount = request.get("xp_amount", 10)
+    successful = request.get("successful", True)
+
+    if not skill_id:
+        raise HTTPException(status_code=400, detail="skill_id is required")
+
+    if skill_id not in SKILL_DEFINITIONS:
+        raise HTTPException(status_code=400, detail=f"Unknown skill: {skill_id}")
+
+    try:
+        manager = get_skill_manager(db)
+        profile = manager.get_or_create_profile(str(user_id))
+        result = manager.add_xp(profile, skill_id, xp_amount, successful)
+        return result
+    except Exception as e:
+        print(f"Error awarding XP: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to award XP: {str(e)}")
+
+
+@app.get("/api/skills/unlocks", tags=["Skills"])
+async def get_available_unlocks(
+    db: Database = Depends(get_database),
+    user_id_from_token: str = Depends(verify_token),
+):
+    """
+    Get all unlockable content with current unlock status.
+
+    Returns:
+        - unlocked: Content already unlocked
+        - locked: Content still locked
+        - next_unlocks: Content close to being unlocked (>50% progress)
+    """
+    try:
+        user_id = uuid.UUID(user_id_from_token)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid user_id from token")
+
+    try:
+        manager = get_skill_manager(db)
+        profile = manager.get_or_create_profile(str(user_id))
+        return manager.get_available_content(profile)
+    except Exception as e:
+        print(f"Error getting unlocks: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to get unlocks: {str(e)}")
+
+
+@app.get("/api/skills/achievements", tags=["Skills"])
+async def get_achievements(
+    db: Database = Depends(get_database),
+    user_id_from_token: str = Depends(verify_token),
+):
+    """
+    Get all achievements with earned status and progress.
+
+    Returns:
+        - earned: Achievements already earned
+        - available: Achievements not yet earned (with progress)
+    """
+    try:
+        user_id = uuid.UUID(user_id_from_token)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid user_id from token")
+
+    try:
+        manager = get_skill_manager(db)
+        profile = manager.get_or_create_profile(str(user_id))
+        return manager.get_achievements(profile)
+    except Exception as e:
+        print(f"Error getting achievements: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to get achievements: {str(e)}")
+
+
+@app.get("/api/skills/definitions", tags=["Skills"])
+async def get_skill_definitions():
+    """
+    Get all skill definitions (no auth required).
+
+    Returns list of all skills with their metadata.
+    """
+    return {
+        "skills": SKILL_DEFINITIONS,
+        "total_skills": len(SKILL_DEFINITIONS),
+    }
+
+
+# ============================================================================
+# Conversation Replay Endpoints
+# ============================================================================
+
+# Global replay manager
+_replay_manager: Optional[ReplayManager] = None
+
+def get_replay_manager(db: Database = Depends(get_database)) -> ReplayManager:
+    """Get or create replay manager with database connection."""
+    global _replay_manager
+    if _replay_manager is None or _replay_manager.db is None:
+        _replay_manager = create_replay_manager_with_db(db)
+    return _replay_manager
+
+
+@app.get("/api/replays", tags=["Replays"])
+async def get_user_replays(
+    limit: int = 10,
+    db: Database = Depends(get_database),
+    user_id_from_token: str = Depends(verify_token),
+):
+    """
+    Get list of user's recent conversation replays (summaries only).
+
+    Query params:
+        - limit: Max number of replays to return (default 10)
+
+    Returns list of replay summaries with session_id, scenario, timestamps, and stats.
+    """
+    try:
+        user_id = uuid.UUID(user_id_from_token)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid user_id from token")
+
+    try:
+        manager = get_replay_manager(db)
+        replays = manager.get_user_replays(str(user_id), limit)
+        return {"replays": replays, "count": len(replays)}
+    except Exception as e:
+        print(f"Error getting replays: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to get replays: {str(e)}")
+
+
+@app.get("/api/replays/{session_id}", tags=["Replays"])
+async def get_replay_detail(
+    session_id: str,
+    db: Database = Depends(get_database),
+    user_id_from_token: str = Depends(verify_token),
+):
+    """
+    Get full replay data including all segments and annotations.
+
+    Path params:
+        - session_id: UUID of the conversation session
+
+    Returns complete replay with transcript, timestamps, and coaching annotations.
+    """
+    try:
+        user_id = uuid.UUID(user_id_from_token)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid user_id from token")
+
+    try:
+        manager = get_replay_manager(db)
+        replay = manager.get_replay(session_id)
+
+        if not replay:
+            raise HTTPException(status_code=404, detail="Replay not found")
+
+        # Verify ownership
+        if replay.user_id != str(user_id):
+            raise HTTPException(status_code=403, detail="Not authorized to view this replay")
+
+        return replay.to_dict()
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"Error getting replay: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to get replay: {str(e)}")
+
+
+# ============================================================================
+# Phoneme Analysis Endpoints
+# ============================================================================
+
+@app.post("/api/pronunciation/phoneme-analysis", tags=["Pronunciation"])
+async def analyze_phonemes(
+    request: dict,
+    user_id_from_token: str = Depends(verify_token),
+):
+    """
+    Analyze pronunciation with L1 interference patterns.
+
+    Body:
+        - text: The expected text
+        - asr_words: List of ASR word results with timing/confidence
+        - native_language: User's native language (e.g., "spanish", "chinese")
+        - audio_quality: Audio quality score (0-100)
+
+    Returns phoneme analysis with L1 patterns and recommendations.
+    """
+    text = request.get("text", "")
+    asr_words = request.get("asr_words", [])
+    native_language = request.get("native_language", "spanish")
+    audio_quality = request.get("audio_quality", 100)
+
+    if not text:
+        raise HTTPException(status_code=400, detail="text is required")
+
+    try:
+        result = analyze_pronunciation_from_asr(
+            expected_text=text,
+            asr_words=asr_words,
+            native_language=native_language,
+            audio_quality=audio_quality
+        )
+        return result.to_dict()
+    except Exception as e:
+        print(f"Error analyzing phonemes: {e}")
+        raise HTTPException(status_code=500, detail=f"Phoneme analysis failed: {str(e)}")
 
 
 @app.post("/api/speech/synthesize")

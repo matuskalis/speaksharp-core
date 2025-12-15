@@ -9,19 +9,29 @@ AI-powered English learning tutor core system with state machine, scenario-based
 ```
 vorex-backend/
 ├── app/
-│   ├── api2.py             # Production API (used by Dockerfile)
-│   ├── api.py              # Development API
-│   ├── models.py           # Pydantic data models
-│   ├── state_machine.py    # App state machine with 5 states
-│   ├── tutor_agent.py      # AI tutor with error tagging
-│   ├── scenarios.py        # 5 conversation scenarios
-│   ├── lessons.py          # 11 structured lessons (A1-A2)
-│   └── srs_system.py       # Spaced repetition system (SM-2)
+│   ├── api2.py               # Production API (used by Dockerfile)
+│   ├── api.py                # Development API
+│   ├── models.py             # Pydantic data models
+│   ├── state_machine.py      # App state machine with 5 states
+│   ├── tutor_agent.py        # AI tutor with error tagging
+│   ├── scenarios.py          # 28 conversation scenarios
+│   ├── lessons.py            # 11 structured lessons (A1-A2)
+│   ├── srs_system.py         # Spaced repetition system (SM-2)
+│   ├── ai_orchestrator.py    # Multi-AI parallel processing
+│   ├── language_profile.py   # Adaptive user profiling
+│   ├── audio_quality.py      # Audio quality detection
+│   ├── asr_client.py         # ASR integration (Whisper)
+│   ├── skill_unlocks.py      # Gamified XP/unlock progression (NEW)
+│   ├── phoneme_analyzer.py   # IPA-based pronunciation analysis (NEW)
+│   └── conversation_replay.py # Session replay with coaching (NEW)
 ├── database/
-│   └── schema.sql          # Supabase-ready PostgreSQL schemas
-├── demo_integration.py     # End-to-end runnable demo
-├── requirements.txt        # Python dependencies
-└── README.md              # This file
+│   ├── schema.sql            # Core PostgreSQL schemas
+│   ├── migration_016_language_profile.sql   # User profile tables
+│   ├── migration_017_conversation_replays.sql # Replay storage (NEW)
+│   └── migration_018_skill_unlocks.sql      # XP/achievements (NEW)
+├── demo_integration.py       # End-to-end runnable demo
+├── requirements.txt          # Python dependencies
+└── README.md                 # This file
 ```
 
 ## Components
@@ -115,6 +125,115 @@ Supabase-ready PostgreSQL with tables:
 - `content_library` - Lessons and scenarios
 
 Functions: `get_due_cards()`, `update_card_after_review()`, `create_card_from_error()`, `update_skill_node()`, `get_weakest_skills()`
+
+### 7. AI Orchestrator (`ai_orchestrator.py`)
+
+Multi-AI parallel processing system that coordinates:
+- **Ranking AI** - Evaluates grammar, fluency, vocabulary (0-100 scores)
+- **Conversation AI** - Generates persona-aware responses with full history
+- **Pronunciation AI** - Analyzes phoneme accuracy (optional)
+
+All AIs run concurrently using `asyncio.gather()` for minimal latency. Enhanced with User Language Profile injection for adaptive tutoring.
+
+```python
+from app.ai_orchestrator import create_orchestrator_with_db
+
+orchestrator = create_orchestrator_with_db(db)
+result = await orchestrator.process_user_turn(
+    audio_bytes=audio_data,
+    conversation_history=history,
+    persona=persona_config,
+    include_ranking=True,
+    include_pronunciation=True,
+    user_id=user_uuid
+)
+```
+
+### 8. User Language Profile (`language_profile.py`)
+
+Adaptive user profiling system that tracks:
+- **Grammar Weaknesses** - Error types (articles, tenses, prepositions) with severity
+- **Phonetic Weaknesses** - IPA phoneme confusion patterns (e.g., /θ/ → /s/)
+- **Per-Skill CEFR Levels** - Independent tracking for speaking, grammar, vocabulary, pronunciation, fluency
+- **L1 Interference Patterns** - Pre-seeded patterns for Spanish, Chinese, Japanese, Portuguese, Russian, Arabic
+
+The profile is automatically injected into AI prompts for personalized corrections:
+
+```python
+from app.language_profile import LanguageProfileManager
+
+manager = LanguageProfileManager(db)
+profile = manager.get_profile(user_id)
+prompt_injection = manager.get_prompt_injection(user_id)  # Returns adaptive tutor instructions
+```
+
+### 9. Audio Quality Detection (`audio_quality.py`)
+
+Analyzes recording conditions to adjust pronunciation scoring:
+- Background noise level (dB)
+- Signal-to-noise ratio
+- Clipping detection
+- Volume normalization recommendations
+
+Poor audio quality triggers `mic_quality_warning` to prevent unfair pronunciation penalties.
+
+### 10. Skill Unlocks System (`skill_unlocks.py`)
+
+Gamified progression system with XP, levels, achievements, and content unlocking:
+- **XP Tracking** - Earn XP from conversations, practice, achievements
+- **Skill Categories** - Grammar, vocabulary, pronunciation, fluency, cultural awareness
+- **Level Progression** - 100 XP per level with milestone achievements
+- **Content Unlocking** - Lock advanced scenarios/lessons behind skill requirements
+- **Daily XP Cap** - 500 XP/day to encourage consistent practice
+- **Leaderboards** - Compare progress with other learners
+
+```python
+from app.skill_unlocks import SkillUnlockManager
+
+manager = SkillUnlockManager(db)
+result = await manager.award_xp(
+    user_id=user_uuid,
+    skill_id="grammar",
+    xp=25,
+    source="conversation"
+)
+# Returns: new level, unlocked content, achievements earned
+```
+
+### 11. Phoneme Analyzer (`phoneme_analyzer.py`)
+
+IPA-based pronunciation analysis with L1-specific patterns:
+- **Phoneme Extraction** - Extract IPA phonemes from transcribed text
+- **L1 Interference Detection** - Identify patterns like /θ/→/s/ for Spanish speakers
+- **Severity Scoring** - Rate pronunciation issues by impact
+- **Recommendations** - Tailored practice suggestions per L1
+
+Supported L1 patterns: Spanish, Portuguese, Chinese, Japanese, Korean, Arabic, French, Russian
+
+```python
+from app.phoneme_analyzer import PhonemeAnalyzer
+
+analyzer = PhonemeAnalyzer(native_language="spanish")
+result = analyzer.analyze("I think this is a great thing")
+# Returns: l1_patterns detected, phoneme scores, recommendations
+```
+
+### 12. Conversation Replay (`conversation_replay.py`)
+
+Session replay with timestamped coaching annotations:
+- **Transcript Segments** - Word-level timing with speaker roles
+- **Coaching Annotations** - Errors, improvements, praise, pronunciation notes
+- **Summary Statistics** - Total errors, accuracy estimate, session duration
+- **Database Persistence** - Store and retrieve past sessions for review
+
+```python
+from app.conversation_replay import ConversationReplayBuilder
+
+builder = ConversationReplayBuilder(session_id, user_id, "cafe_ordering")
+builder.add_user_turn(transcript, word_timings, ranking_result, pronunciation_result)
+builder.add_assistant_turn(tutor_response)
+replay = builder.build_replay()  # Returns SessionReplay with all annotations
+```
 
 ## Installation
 
@@ -415,6 +534,43 @@ The adaptive algorithm:
 - Ends after 10-15 questions or when level stabilizes
 - Returns final CEFR level (A1-C2) with confidence score
 
+#### Skills API (Gamification)
+```bash
+# Get user's skill profile
+curl http://localhost:8000/api/skills/profile/{user_id}
+
+# Award XP for an activity
+curl -X POST http://localhost:8000/api/skills/xp \
+  -H "Content-Type: application/json" \
+  -d '{"user_id": "uuid", "skill_id": "grammar", "xp": 25, "source": "conversation"}'
+
+# Check unlockable content
+curl http://localhost:8000/api/skills/unlocks/{user_id}
+
+# Get earned achievements
+curl http://localhost:8000/api/skills/achievements/{user_id}
+
+# Get skill definitions
+curl http://localhost:8000/api/skills/definitions
+```
+
+#### Conversation Replays API
+```bash
+# Get user's recent replays
+curl http://localhost:8000/api/replays/{user_id}?limit=10
+
+# Get full replay with annotations
+curl http://localhost:8000/api/replays/session/{session_id}
+```
+
+#### Pronunciation Analysis API
+```bash
+# Analyze pronunciation with L1-specific patterns
+curl -X POST http://localhost:8000/api/pronunciation/phoneme-analysis \
+  -H "Content-Type: application/json" \
+  -d '{"text": "I think this is great", "native_language": "spanish"}'
+```
+
 See full API documentation at `http://localhost:8000/docs` when the server is running.
 
 ## Testing
@@ -622,6 +778,7 @@ railway status
 
 ## Next Steps
 
+### Completed
 - ✅ Database layer with PostgreSQL/Supabase
 - ✅ REST API with FastAPI
 - ✅ Docker containerization
@@ -632,9 +789,23 @@ railway status
 - ✅ Frontend client (Next.js at vorex.app)
 - ✅ Authentication (Supabase Auth)
 - ✅ Railway deployment
-- 🔄 Add more scenarios (currently 5, target 30-50)
-- 🔄 Expand lessons beyond A2 (currently 11 A1-A2 lessons)
-- 🔄 Implement pronunciation scoring
-- 🔄 Add analytics and progress tracking
+- ✅ Multi-AI orchestrator with parallel processing
+- ✅ User Language Profile with adaptive tutoring
+- ✅ Audio quality detection for pronunciation accuracy
+- ✅ L1 interference patterns for 6 major languages
+- ✅ Pronunciation phoneme analysis with IPA confusion tracking
+- ✅ Conversation replay with coaching annotations
+- ✅ Skill-based XP/unlock progression system
 
-**Last Updated**: December 7, 2025
+### In Progress
+- 🔄 WebSocket real-time tutoring
+- 🔄 Expand scenarios (5 → 30+)
+- 🔄 Expand lessons beyond A2 (11 → 50+)
+
+### Planned
+- 📋 Mobile app (React Native/Expo)
+- 📋 Analytics dashboard for learning insights
+- 📋 Redis caching for hot data
+- 📋 Modularize api2.py into sub-routers
+
+**Last Updated**: December 14, 2025

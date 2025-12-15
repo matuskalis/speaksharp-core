@@ -29,6 +29,12 @@ from app.language_profile import (
     UserLanguageProfile,
     analyze_errors_from_ranking
 )
+from app.phoneme_analyzer import (
+    PhonemeAnalyzer,
+    PhonemeAnalysisResult,
+    analyze_pronunciation_from_asr,
+    get_phoneme_analyzer
+)
 
 
 @dataclass
@@ -73,21 +79,32 @@ class ConversationResult:
 
 @dataclass
 class PronunciationResult:
-    """Result from the pronunciation AI."""
+    """Result from the pronunciation AI with IPA phoneme analysis."""
     overall_score: int
     word_scores: List[Dict[str, Any]]
     problem_sounds: List[str]
     mic_quality_warning: bool = False
     confidence_note: Optional[str] = None
+    # Enhanced phoneme analysis
+    phoneme_analysis: Optional[Dict[str, Any]] = None
+    l1_patterns: List[Dict[str, Any]] = field(default_factory=list)
+    recommendations: List[str] = field(default_factory=list)
 
     def to_dict(self) -> dict:
-        return {
+        result = {
             "overall_score": self.overall_score,
             "word_scores": self.word_scores,
             "problem_sounds": self.problem_sounds,
             "mic_quality_warning": self.mic_quality_warning,
-            "confidence_note": self.confidence_note
+            "confidence_note": self.confidence_note,
         }
+        if self.phoneme_analysis:
+            result["phoneme_analysis"] = self.phoneme_analysis
+        if self.l1_patterns:
+            result["l1_patterns"] = self.l1_patterns
+        if self.recommendations:
+            result["recommendations"] = self.recommendations
+        return result
 
 
 @dataclass
@@ -216,10 +233,16 @@ class AIOrchestrator:
 
         # Optionally run pronunciation AI
         if include_pronunciation and asr_result.words:
+            # Get native language from profile for L1-specific phoneme analysis
+            native_lang = "spanish"  # default
+            if language_profile and hasattr(language_profile, 'native_language'):
+                native_lang = language_profile.native_language or "spanish"
+
             pronunciation_task = self._run_pronunciation_ai(
                 transcript,
                 asr_result.words,
-                audio_quality
+                audio_quality,
+                native_language=native_lang
             )
             tasks.append(("pronunciation", pronunciation_task))
 
@@ -419,27 +442,34 @@ Respond ONLY with valid JSON:
         self,
         transcript: str,
         word_timings: list,
-        audio_quality: AudioQualityResult
+        audio_quality: AudioQualityResult,
+        native_language: str = "spanish"
     ) -> PronunciationResult:
         """
-        Run pronunciation analysis.
+        Run pronunciation analysis with IPA phoneme tracking.
 
-        Note: For now, this uses a simple heuristic.
-        Full Allosaurus integration would go here.
+        Uses PhonemeAnalyzer for L1-specific interference patterns.
         """
-        # Simple word-level scoring based on ASR confidence
+        # Convert word timings to dict format for phoneme analyzer
+        asr_words = []
         word_scores = []
-        problem_sounds = set()
 
         for w in word_timings:
             confidence = getattr(w, 'confidence', None)
             if confidence is not None:
                 score = int(confidence * 100)
             else:
-                # No confidence from Whisper, use random reasonable score
                 import random
                 score = random.randint(70, 95)
+                confidence = score / 100
 
+            word_data = {
+                "word": w.word.strip(),
+                "confidence": confidence,
+                "start": w.start,
+                "end": w.end,
+            }
+            asr_words.append(word_data)
             word_scores.append({
                 "word": w.word.strip(),
                 "score": score,
@@ -447,33 +477,50 @@ Respond ONLY with valid JSON:
                 "end": w.end
             })
 
-            # Identify problem sounds (words with low scores)
-            if score < 70:
-                # Simplified: mark first consonant as problematic
-                word = w.word.lower().strip()
-                if word and word[0].isalpha():
-                    problem_sounds.add(f"/{word[0]}/")
+        # Run phoneme analysis
+        try:
+            phoneme_result = analyze_pronunciation_from_asr(
+                expected_text=transcript,
+                asr_words=asr_words,
+                native_language=native_language,
+                audio_quality=audio_quality.overall_quality
+            )
 
-        # Calculate overall score
-        if word_scores:
-            overall = sum(ws["score"] for ws in word_scores) // len(word_scores)
-        else:
-            overall = 75
+            # Extract problem sounds in IPA
+            problem_sounds = [
+                f"/{p['phoneme']}/"
+                for p in phoneme_result.problem_phonemes[:5]
+            ]
+
+            # Use phoneme analyzer's overall score
+            overall = phoneme_result.overall_score
+
+        except Exception as e:
+            print(f"[AIOrchestrator] Phoneme analysis error: {e}")
+            # Fallback to simple scoring
+            phoneme_result = None
+            problem_sounds = []
+            if word_scores:
+                overall = sum(ws["score"] for ws in word_scores) // len(word_scores)
+            else:
+                overall = 75
 
         # Add confidence penalty for poor audio
         mic_warning = should_penalize_pronunciation(audio_quality)
         confidence_note = None
         if mic_warning:
             confidence_note = "Audio quality may affect accuracy. Try a quieter environment."
-            # Boost score slightly to account for mic issues
             overall = min(100, overall + 5)
 
         return PronunciationResult(
             overall_score=overall,
             word_scores=word_scores,
-            problem_sounds=list(problem_sounds),
+            problem_sounds=problem_sounds,
             mic_quality_warning=mic_warning,
-            confidence_note=confidence_note
+            confidence_note=confidence_note,
+            phoneme_analysis=phoneme_result.to_dict() if phoneme_result else None,
+            l1_patterns=phoneme_result.l1_patterns_detected if phoneme_result else [],
+            recommendations=phoneme_result.recommendations if phoneme_result else [],
         )
 
     def _call_openai_chat(
