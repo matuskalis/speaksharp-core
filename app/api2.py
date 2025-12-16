@@ -11,7 +11,7 @@ Provides HTTP endpoints for:
 
 import uuid
 from typing import Optional, List, Dict, Any
-from datetime import datetime
+from datetime import datetime, timedelta
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, HTTPException, Depends, File, UploadFile, Form
@@ -2175,13 +2175,14 @@ async def get_personalized_recommendations(
                         })
 
                 # Get recent sessions to avoid recommending completed scenarios
+                # Note: scenario_id is stored in metadata JSONB, not as a direct column
                 cur.execute("""
-                    SELECT scenario_id, MAX(started_at) as last_played
+                    SELECT metadata->>'scenario_id' as scenario_id, MAX(started_at) as last_played
                     FROM sessions
                     WHERE user_id = %s
-                      AND scenario_id IS NOT NULL
+                      AND metadata->>'scenario_id' IS NOT NULL
                       AND started_at > NOW() - INTERVAL '7 days'
-                    GROUP BY scenario_id
+                    GROUP BY metadata->>'scenario_id'
                 """, (str(user_id),))
                 recent_rows = cur.fetchall()
 
@@ -6403,6 +6404,61 @@ async def get_progress_summary(
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to get progress summary: {str(e)}")
+
+
+@app.get("/api/sessions/daily-breakdown", tags=["Sessions"])
+async def get_daily_breakdown(
+    days: int = 7,
+    db: Database = Depends(get_database),
+    user_id_from_token: str = Depends(verify_token),
+):
+    """
+    Get daily study session breakdown for the past N days.
+
+    Returns minutes practiced per day for progress visualization.
+    """
+    try:
+        user_id = uuid.UUID(user_id_from_token)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid user_id from token")
+
+    try:
+        with db.get_connection() as conn:
+            with conn.cursor() as cur:
+                # Get study session minutes per day for the last N days
+                cur.execute("""
+                    SELECT
+                        DATE(created_at) as date,
+                        COALESCE(SUM(duration_seconds) / 60, 0) as total_minutes
+                    FROM study_sessions
+                    WHERE user_id = %s
+                      AND created_at >= NOW() - INTERVAL '%s days'
+                    GROUP BY DATE(created_at)
+                    ORDER BY date DESC
+                """, (str(user_id), days))
+                rows = cur.fetchall()
+
+                # Create a dict for quick lookup
+                day_minutes = {}
+                for row in rows:
+                    if isinstance(row, dict):
+                        day_minutes[str(row['date'])] = int(row['total_minutes'])
+                    else:
+                        day_minutes[str(row[0])] = int(row[1])
+
+                # Build result for each day in range
+                result_days = []
+                for i in range(days):
+                    date = (datetime.now() - timedelta(days=i)).strftime('%Y-%m-%d')
+                    result_days.append({
+                        "date": date,
+                        "total_minutes": day_minutes.get(date, 0)
+                    })
+
+                return {"days": result_days}
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to get daily breakdown: {str(e)}")
 
 
 @app.get("/api/user/diagnostic-status", tags=["User"])
