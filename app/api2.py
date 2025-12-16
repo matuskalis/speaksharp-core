@@ -2147,59 +2147,73 @@ async def get_personalized_recommendations(
 
     try:
         recommendations = []
+        weak_skills = []
+        recent_scenarios = {}
+        srs_due_count = 0
 
         # Get recommended skills (lowest mastery first)
         with db.get_connection() as conn:
             with conn.cursor() as cur:
-                # Get user's weakest skills
-                cur.execute("SELECT * FROM get_recommended_skills(%s, %s)", (str(user_id), 10))
-                skill_rows = cur.fetchall()
+                # Try to get user's weakest skills (function may not exist)
+                try:
+                    cur.execute("SELECT * FROM get_recommended_skills(%s, %s)", (str(user_id), 10))
+                    skill_rows = cur.fetchall()
 
-                weak_skills = []
-                for row in skill_rows:
-                    if isinstance(row, dict):
-                        weak_skills.append({
-                            "skill_key": row['skill_key'],
-                            "name": row['name_en'],
-                            "domain": row['domain'],
-                            "level": row['cefr_level'],
-                            "p_learned": row['p_learned'],
-                        })
-                    else:
-                        weak_skills.append({
-                            "skill_key": row[0],
-                            "name": row[1],
-                            "domain": row[2],
-                            "level": row[3],
-                            "p_learned": row[4],
-                        })
+                    for row in skill_rows:
+                        if isinstance(row, dict):
+                            weak_skills.append({
+                                "skill_key": row['skill_key'],
+                                "name": row['name_en'],
+                                "domain": row['domain'],
+                                "level": row['cefr_level'],
+                                "p_learned": row['p_learned'],
+                            })
+                        else:
+                            weak_skills.append({
+                                "skill_key": row[0],
+                                "name": row[1],
+                                "domain": row[2],
+                                "level": row[3],
+                                "p_learned": row[4],
+                            })
+                except Exception:
+                    # Function doesn't exist, use empty skills
+                    weak_skills = []
+                    conn.rollback()
 
                 # Get recent sessions to avoid recommending completed scenarios
                 # Note: scenario_id is stored in metadata JSONB, not as a direct column
-                cur.execute("""
-                    SELECT metadata->>'scenario_id' as scenario_id, MAX(started_at) as last_played
-                    FROM sessions
-                    WHERE user_id = %s
-                      AND metadata->>'scenario_id' IS NOT NULL
-                      AND started_at > NOW() - INTERVAL '7 days'
-                    GROUP BY metadata->>'scenario_id'
-                """, (str(user_id),))
-                recent_rows = cur.fetchall()
+                try:
+                    cur.execute("""
+                        SELECT metadata->>'scenario_id' as scenario_id, MAX(started_at) as last_played
+                        FROM sessions
+                        WHERE user_id = %s
+                          AND metadata->>'scenario_id' IS NOT NULL
+                          AND started_at > NOW() - INTERVAL '7 days'
+                        GROUP BY metadata->>'scenario_id'
+                    """, (str(user_id),))
+                    recent_rows = cur.fetchall()
 
-                recent_scenarios = {}
-                for row in recent_rows:
-                    if isinstance(row, dict):
-                        recent_scenarios[row['scenario_id']] = row['last_played']
-                    else:
-                        recent_scenarios[row[0]] = row[1]
+                    for row in recent_rows:
+                        if isinstance(row, dict):
+                            recent_scenarios[row['scenario_id']] = row['last_played']
+                        else:
+                            recent_scenarios[row[0]] = row[1]
+                except Exception:
+                    recent_scenarios = {}
+                    conn.rollback()
 
                 # Get SRS due count
-                cur.execute("""
-                    SELECT COUNT(*) FROM srs_cards
-                    WHERE user_id = %s AND next_review_date <= NOW()
-                """, (str(user_id),))
-                srs_result = cur.fetchone()
-                srs_due_count = srs_result[0] if srs_result else 0
+                try:
+                    cur.execute("""
+                        SELECT COUNT(*) FROM srs_cards
+                        WHERE user_id = %s AND next_review_date <= NOW()
+                    """, (str(user_id),))
+                    srs_result = cur.fetchone()
+                    srs_due_count = srs_result[0] if srs_result else 0
+                except Exception:
+                    srs_due_count = 0
+                    conn.rollback()
 
         # Build skill tags set from weak skills
         weak_skill_tags = set()
