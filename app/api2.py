@@ -578,6 +578,28 @@ def run_migrations(db):
                     $$ LANGUAGE plpgsql;
                 """)
 
+                # Migration 015: Session Analytics - Session Results table
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS session_results (
+                        session_result_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                        user_id UUID NOT NULL REFERENCES user_profiles(user_id) ON DELETE CASCADE,
+                        session_type VARCHAR(50) NOT NULL,
+                        duration_seconds INTEGER NOT NULL CHECK (duration_seconds >= 0),
+                        words_spoken INTEGER DEFAULT 0 CHECK (words_spoken >= 0),
+                        pronunciation_score FLOAT DEFAULT 0.0 CHECK (pronunciation_score >= 0 AND pronunciation_score <= 100),
+                        fluency_score FLOAT DEFAULT 0.0 CHECK (fluency_score >= 0 AND fluency_score <= 100),
+                        grammar_score FLOAT DEFAULT 0.0 CHECK (grammar_score >= 0 AND grammar_score <= 100),
+                        topics TEXT[] DEFAULT '{}',
+                        vocabulary_learned TEXT[] DEFAULT '{}',
+                        areas_to_improve TEXT[] DEFAULT '{}',
+                        metadata JSONB,
+                        created_at TIMESTAMP DEFAULT NOW(),
+                        updated_at TIMESTAMP DEFAULT NOW()
+                    );
+                """)
+                cur.execute("CREATE INDEX IF NOT EXISTS idx_session_results_user_created ON session_results(user_id, created_at DESC);")
+                cur.execute("CREATE INDEX IF NOT EXISTS idx_session_results_type_user ON session_results(session_type, user_id, created_at DESC);")
+
                 conn.commit()
                 print("✓ Database migrations applied")
     except Exception as e:
@@ -2097,6 +2119,261 @@ async def submit_skill_practice(
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to update skill: {str(e)}")
+
+
+# ============================================================================
+# Recommendations Endpoints
+# ============================================================================
+
+@app.get("/api/recommendations", tags=["Recommendations"])
+async def get_personalized_recommendations(
+    count: int = 5,
+    db: Database = Depends(get_database),
+    user_id_from_token: str = Depends(verify_token),
+):
+    """
+    Get personalized lesson recommendations based on user's skill levels,
+    recent session history, and SRS due items.
+
+    Returns scenarios to practice with reasons for each recommendation.
+    """
+    from app.scenarios import SCENARIO_TEMPLATES
+    from datetime import datetime, timedelta
+
+    try:
+        user_id = uuid.UUID(user_id_from_token)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid user_id from token")
+
+    try:
+        recommendations = []
+
+        # Get recommended skills (lowest mastery first)
+        with db.get_connection() as conn:
+            with conn.cursor() as cur:
+                # Get user's weakest skills
+                cur.execute("SELECT * FROM get_recommended_skills(%s, %s)", (str(user_id), 10))
+                skill_rows = cur.fetchall()
+
+                weak_skills = []
+                for row in skill_rows:
+                    if isinstance(row, dict):
+                        weak_skills.append({
+                            "skill_key": row['skill_key'],
+                            "name": row['name_en'],
+                            "domain": row['domain'],
+                            "level": row['cefr_level'],
+                            "p_learned": row['p_learned'],
+                        })
+                    else:
+                        weak_skills.append({
+                            "skill_key": row[0],
+                            "name": row[1],
+                            "domain": row[2],
+                            "level": row[3],
+                            "p_learned": row[4],
+                        })
+
+                # Get recent sessions to avoid recommending completed scenarios
+                cur.execute("""
+                    SELECT scenario_id, MAX(started_at) as last_played
+                    FROM sessions
+                    WHERE user_id = %s
+                      AND scenario_id IS NOT NULL
+                      AND started_at > NOW() - INTERVAL '7 days'
+                    GROUP BY scenario_id
+                """, (str(user_id),))
+                recent_rows = cur.fetchall()
+
+                recent_scenarios = {}
+                for row in recent_rows:
+                    if isinstance(row, dict):
+                        recent_scenarios[row['scenario_id']] = row['last_played']
+                    else:
+                        recent_scenarios[row[0]] = row[1]
+
+                # Get SRS due count
+                cur.execute("""
+                    SELECT COUNT(*) FROM srs_cards
+                    WHERE user_id = %s AND next_review <= NOW()
+                """, (str(user_id),))
+                srs_result = cur.fetchone()
+                srs_due_count = srs_result[0] if srs_result else 0
+
+        # Build skill tags set from weak skills
+        weak_skill_tags = set()
+        for skill in weak_skills:
+            weak_skill_tags.add(skill['skill_key'])
+            if skill['domain']:
+                weak_skill_tags.add(skill['domain'].lower())
+
+        # Score each scenario based on skill overlap and recency
+        scored_scenarios = []
+        for scenario_id, scenario in SCENARIO_TEMPLATES.items():
+            score = 0
+            reasons = []
+
+            # Check skill tag overlap
+            scenario_tags = set(tag.lower() for tag in scenario.difficulty_tags)
+            overlap = weak_skill_tags.intersection(scenario_tags)
+
+            if overlap:
+                score += len(overlap) * 10
+                reasons.append(f"Targets skills you need to practice: {', '.join(list(overlap)[:3])}")
+
+            # Penalize recently played scenarios
+            if scenario_id in recent_scenarios:
+                last_played = recent_scenarios[scenario_id]
+                if last_played.tzinfo:
+                    last_played = last_played.replace(tzinfo=None)
+                days_ago = (datetime.now() - last_played).days
+                if days_ago < 1:
+                    score -= 50  # Heavy penalty for today
+                    reasons.append("Played today")
+                elif days_ago < 3:
+                    score -= 20
+                    reasons.append(f"Played {days_ago} days ago")
+                else:
+                    score -= 5
+            else:
+                score += 5
+                reasons.append("New scenario for you")
+
+            # Boost transactional scenarios for beginners
+            if weak_skills and weak_skills[0]['p_learned'] < 0.3:
+                if 'transactional' in scenario_tags:
+                    score += 5
+                    reasons.append("Good for building confidence")
+
+            scored_scenarios.append({
+                "scenario_id": scenario.scenario_id,
+                "title": scenario.title,
+                "level_min": scenario.level_min,
+                "level_max": scenario.level_max,
+                "description": scenario.situation_description,
+                "difficulty_tags": scenario.difficulty_tags,
+                "score": score,
+                "reasons": reasons[:2],  # Top 2 reasons
+                "type": "scenario"
+            })
+
+        # Sort by score descending
+        scored_scenarios.sort(key=lambda x: x['score'], reverse=True)
+
+        # Add top scenarios to recommendations
+        for scenario in scored_scenarios[:count]:
+            if scenario['score'] > -30:  # Only include if not heavily penalized
+                recommendations.append({
+                    "id": scenario['scenario_id'],
+                    "title": scenario['title'],
+                    "type": "scenario",
+                    "level": f"{scenario['level_min']}-{scenario['level_max']}",
+                    "description": scenario['description'],
+                    "reason": scenario['reasons'][0] if scenario['reasons'] else "Recommended for you",
+                    "tags": scenario['difficulty_tags'][:4],
+                    "priority": min(100, max(0, 50 + scenario['score']))
+                })
+
+        # Add SRS review recommendation if items are due
+        if srs_due_count > 0:
+            recommendations.insert(0, {
+                "id": "srs_review",
+                "title": "Review Due Items",
+                "type": "srs",
+                "level": "Mixed",
+                "description": f"You have {srs_due_count} items ready for review",
+                "reason": "Keep your memory fresh",
+                "tags": ["spaced-repetition", "review"],
+                "priority": 95 if srs_due_count >= 5 else 75,
+                "due_count": srs_due_count
+            })
+
+        return {
+            "recommendations": recommendations[:count],
+            "weak_skills": weak_skills[:3],
+            "srs_due_count": srs_due_count
+        }
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to get recommendations: {str(e)}")
+
+
+@app.get("/api/scenarios/progress", tags=["Recommendations"])
+async def get_scenarios_with_progress(
+    db: Database = Depends(get_database),
+    user_id_from_token: str = Depends(verify_token),
+):
+    """
+    Get all scenarios with user's progress (completion count, last played, best score).
+    """
+    from app.scenarios import SCENARIO_TEMPLATES
+
+    try:
+        user_id = uuid.UUID(user_id_from_token)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid user_id from token")
+
+    try:
+        # Get user's session history for scenarios
+        with db.get_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    SELECT
+                        scenario_id,
+                        COUNT(*) as play_count,
+                        MAX(started_at) as last_played,
+                        MAX(score) as best_score,
+                        COUNT(CASE WHEN completed_at IS NOT NULL THEN 1 END) as completed_count
+                    FROM sessions
+                    WHERE user_id = %s AND scenario_id IS NOT NULL
+                    GROUP BY scenario_id
+                """, (str(user_id),))
+                progress_rows = cur.fetchall()
+
+                progress_map = {}
+                for row in progress_rows:
+                    if isinstance(row, dict):
+                        progress_map[row['scenario_id']] = {
+                            "play_count": row['play_count'],
+                            "last_played": row['last_played'].isoformat() if row['last_played'] else None,
+                            "best_score": row['best_score'],
+                            "completed_count": row['completed_count']
+                        }
+                    else:
+                        progress_map[row[0]] = {
+                            "play_count": row[1],
+                            "last_played": row[2].isoformat() if row[2] else None,
+                            "best_score": row[3],
+                            "completed_count": row[4]
+                        }
+
+        # Build response with progress info
+        scenarios_with_progress = []
+        for scenario_id, scenario in SCENARIO_TEMPLATES.items():
+            progress = progress_map.get(scenario_id, {
+                "play_count": 0,
+                "last_played": None,
+                "best_score": None,
+                "completed_count": 0
+            })
+
+            scenarios_with_progress.append({
+                "scenario_id": scenario.scenario_id,
+                "title": scenario.title,
+                "level_min": scenario.level_min,
+                "level_max": scenario.level_max,
+                "situation_description": scenario.situation_description,
+                "difficulty_tags": scenario.difficulty_tags,
+                "progress": progress
+            })
+
+        return {
+            "scenarios": scenarios_with_progress,
+            "count": len(scenarios_with_progress)
+        }
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to get scenarios with progress: {str(e)}")
 
 
 # ============================================================================
